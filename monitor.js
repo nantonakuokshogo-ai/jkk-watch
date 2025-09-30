@@ -2,10 +2,10 @@ import { chromium } from "playwright";
 import fs from "fs";
 
 /* ===== 設定 ===== */
-const HOME  = "https://jhomes.to-kousya.or.jp/search/jkknet/";
+const HOME     = "https://jhomes.to-kousya.or.jp/search/jkknet/";
 const FRAMESET = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
-const START = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-const KEYWORD = "DK";   // 動作確認用。OKになったら本命ワードに変更
+const START    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
+const KEYWORD  = "DK";   // 動作確認用。OKになったら本命ワードに変更
 /* ================ */
 
 async function gotoRetry(page, url, tries = 3) {
@@ -16,7 +16,7 @@ async function gotoRetry(page, url, tries = 3) {
       return true;
     } catch (e) {
       console.log(`goto fail${i}:`, e.message);
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(800);
     }
   }
   return false;
@@ -28,39 +28,43 @@ async function dumpWhere(page, label) {
 async function screenshot(page, name) {
   try { await page.screenshot({ path: name, fullPage: true }); } catch {}
 }
+async function dumpAllFrames(page, prefix="dump") {
+  try {
+    const lines = [];
+    const all = [page, ...page.frames()];
+    let idx = 0;
+    for (const f of all) {
+      const u = f === page ? page.url() : f.url();
+      const t = await (f === page ? page.title() : f.title()).catch(()=> "");
+      lines.push(`[${idx}] ${u}  |  ${t}`);
+      const html = await f.content().catch(()=> "");
+      fs.writeFileSync(`${prefix}-frame-${idx}.html`, html ?? "");
+      idx++;
+    }
+    fs.writeFileSync(`${prefix}-frames.txt`, lines.join("\n"));
+  } catch {}
+}
 
 /* --- 404/おわび → トップへ戻す（HOME遷移のとき使用） --- */
 async function recoverNotFound(page) {
   const title = (await page.title().catch(()=> "")) || "";
   if (title.includes("見つかりません") || title.includes("おわび")) {
     console.log("[recover] notfound/apology -> click 「トップページへ戻る」");
-    const clickBack = async (ctx) => {
+    const tryOn = async (ctx) => {
       const link = ctx.getByRole("link", { name: /トップページへ戻る/ });
-      if (await link.count()) {
-        await Promise.all([
-          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-          link.first().click()
-        ]);
-        return true;
-      }
-      const btn = ctx.getByRole("button", { name: /トップページへ戻る/ });
-      if (await btn.count()) {
-        await Promise.all([
-          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-          btn.first().click()
-        ]);
-        return true;
-      }
+      if (await link.count()) { await link.first().click().catch(()=>{}); return true; }
+      const btn  = ctx.getByRole("button", { name: /トップページへ戻る/ });
+      if (await btn.count())  { await btn.first().click().catch(()=>{});  return true; }
       return false;
     };
-    if (!(await clickBack(page))) {
-      for (const f of page.frames()) if (await clickBack(f)) break;
+    if (!(await tryOn(page))) {
+      for (const f of page.frames()) if (await tryOn(f)) break;
     }
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(600);
   }
 }
 
-/* --- HOME(どこでも可)へ入る。見つからなくてもOK --- */
+/* --- HOMEへ（クッキー確保目的／見つからなくてもOK） --- */
 async function enterFromHome(page) {
   const CANDIDATES = [
     "https://jhomes.to-kousya.or.jp/",
@@ -77,12 +81,8 @@ async function enterFromHome(page) {
   return true;
 }
 
-// フレームセット /service/ を開き、main フレームに StartInit を必ず読ませる
+/* --- /service/ を開き、main フレームに必ず StartInit を読み込ませる --- */
 async function gotoFrameset(page) {
-  const FRAMESET = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
-  const START    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-
-  // Apology/NotFound 画面で「トップページへ戻る」を押すヘルパ
   const clickBackEverywhere = async () => {
     const tryOn = async (ctx) => {
       const link = ctx.getByRole("link", { name: /トップページへ戻る/ });
@@ -92,16 +92,11 @@ async function gotoFrameset(page) {
       return false;
     };
     let done = await tryOn(page);
-    if (!done) {
-      for (const f of page.frames()) {
-        if (await tryOn(f)) { done = true; break; }
-      }
-    }
-    await page.waitForTimeout(800);
+    if (!done) for (const f of page.frames()) { if (await tryOn(f)) { done = true; break; } }
+    await page.waitForTimeout(600);
     return done;
   };
 
-  // “こちら” を踏むヘルパ
   const clickHereEverywhere = async () => {
     for (const ctx of [page, ...page.frames()]) {
       const a = ctx.getByRole("link", { name: /こちら/ });
@@ -110,69 +105,59 @@ async function gotoFrameset(page) {
           ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
           a.first().click().catch(()=>{})
         ]);
-        await page.waitForTimeout(600);
+        await page.waitForTimeout(500);
       }
     }
   };
 
-  // main フレームを推定
   const findMain = () => {
-    // 1) URLにStartInitを含む
     let f = page.frames().find(fr => /akiyaJyoukenStartInit/i.test(fr.url()));
     if (f) return f;
-    // 2) name="main" / id="main" っぽい
     f = page.frames().find(fr => /(^|\/)main(\.html)?$/i.test(fr.url()) || /main/i.test(fr.name()));
     if (f) return f;
-    // 3) 一番面積が大きそうなフレーム（fallback）
     const all = page.frames().filter(fr => fr !== page.mainFrame());
     return all[0] || null;
   };
 
-  // 最大リトライ
   for (let t = 1; t <= 5; t++) {
     console.log(`[frameset] try ${t}`);
-    // /service/ を開く
     await gotoRetry(page, FRAMESET);
     await page.waitForLoadState("domcontentloaded").catch(()=>{});
 
-    // タイムアウト/おわびなら戻る→再試行
     const title = (await page.title().catch(()=> "")) || "";
     if (title.includes("おわび") || title.includes("見つかりません") || page.url().endsWith("/service/#")) {
       await clickBackEverywhere();
       continue;
     }
 
-    // “こちら” があれば踏む
     await clickHereEverywhere();
 
-    // main フレーム探索
     let main = findMain();
 
-    // StartInit がまだなら、main に直接 StartInit を読ませる（ここが肝）
+    // ここが肝：Referrer を維持しつつ main を StartInit へ遷移
     if (main && !/akiyaJyoukenStartInit/i.test(main.url())) {
       try {
-        console.log("[frameset] force load StartInit into main frame");
-        await main.goto(START, { waitUntil: "domcontentloaded", timeout: 15000 });
+        console.log("[frameset] force load StartInit in main via location.href");
+        await main.evaluate((url) => { location.href = url; }, START);
         await page.waitForTimeout(800);
       } catch (e) {
-        console.log("[frameset] main.goto failed:", e.message);
+        console.log("[frameset] main.evaluate failed:", e.message);
       }
     }
 
-    // 最終チェック
     main = findMain();
     if (main && /akiyaJyoukenStartInit/i.test(main.url())) {
-      return main;              // ← 取得成功
+      return main;
     }
 
-    // まだなら次ループ（念のため）
+    await dumpAllFrames(page, `debug_frameset_try${t}`);
+    await screenshot(page, `debug_frameset_try${t}.png`);
     await page.waitForTimeout(1000);
   }
-
-  return null;  // 取得失敗（呼び出し側でハンドル）
+  return null;
 }
 
-/* --- ページの進捗判定 --- */
+/* --- ページ進捗判定 --- */
 async function _progressHappened(page, prevUrl, prevTitle) {
   try {
     await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(()=>{});
@@ -210,7 +195,7 @@ async function pressSearch(page) {
       const onclick = (await h.getAttribute('onclick').catch(()=>'')) || '';
       const href = (await h.getAttribute('href').catch(()=>'')) || '';
       const s = `${txt} ${val} ${alt} ${title} ${onclick} ${href}`;
-      if (/検索|空き|空家|空室|次へ|同意/i.test(s) || /submit\(/i.test(onclick) || /^javascript:.*submit/i.test(href || "")) {
+      if (/検索|空き|空家|空室|次へ|同意/i.test(s) || /submit\(/i.test(onclick) || /^javascript:.*submit/i.test((href||""))) {
         console.log(`[search] click candidate on ${label}: "${s.trim().slice(0,50)}"`);
         await h.click({ timeout: 4000, force: true }).catch(()=>{});
         if (await _progressHappened(page, prevUrl, prevTitle)) return true;
@@ -219,7 +204,6 @@ async function pressSearch(page) {
       }
     }
 
-    // 保険: form.submit() を全部叩く
     const submitted = await ctx.evaluate(() => {
       const forms = Array.from(document.forms || []);
       forms.forEach(f => { try { f.submit(); } catch(_){} });
@@ -238,7 +222,7 @@ async function pressSearch(page) {
   return false;
 }
 
-/* --- 一覧で「50件」を狙う（あれば） --- */
+/* --- 一覧で「50件」を狙う --- */
 async function setPageSize50(page) {
   const tryOn = async (ctx, label) => {
     const selects = ctx.locator("select");
@@ -259,7 +243,7 @@ async function setPageSize50(page) {
   return false;
 }
 
-/* --- おわび/操作エラー → 1回だけ “フレームセット直行” で復帰 --- */
+/* --- おわび/操作エラー → 1回だけフレームセット直行で復帰 --- */
 async function recoverApologyOnce(page, flag) {
   const title = (await page.title().catch(()=> "")) || "";
   if (!flag.used && (title.includes("おわび") || title.includes("その操作は行わないで下さい") || page.url().endsWith("/service/#"))) {
@@ -272,16 +256,31 @@ async function recoverApologyOnce(page, flag) {
 
 /* ===== メイン ===== */
 (async () => {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--disable-blink-features=AutomationControlled"]
   });
 
+  const context = await browser.newContext({
+    locale: "ja-JP",
+    timezoneId: "Asia/Tokyo",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
+    extraHTTPHeaders: {
+      "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+      "Upgrade-Insecure-Requests": "1"
+    }
+  });
+  const page = await context.newPage();
+
   try {
-    // 1) 入口 → 2) フレームセット（mainフレームを掴む）
+    // 1) 入口 → 2) フレームセット（main フレームを掴む）
     await enterFromHome(page);
     let mainFrame = await gotoFrameset(page);
-    if (!mainFrame) throw new Error("cannot get main frame (StartInit)");
+    if (!mainFrame) {
+      await dumpAllFrames(page, "debug_frameset_final");
+      await screenshot(page, "debug_frameset_final.png");
+      throw new Error("cannot get main frame (StartInit)");
+    }
     await dumpWhere(page, "frameset");
     await screenshot(page, "step2-frameset.png");
 
@@ -320,6 +319,7 @@ async function recoverApologyOnce(page, flag) {
 
   } catch (e) {
     console.error("ERROR", e);
+    await dumpAllFrames(page, "debug_error");
     await screenshot(page, "out.png");
     process.exitCode = 1;
   } finally {
