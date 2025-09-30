@@ -25,12 +25,12 @@ jobs:
       - name: Run
         run: node monitor.js
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: jkk-artifacts
-          path: |
-            *.png
-            *.html
-            debug_*.txt
-          if-no-files-found: warn
+- name: Upload artifacts
+  uses: actions/upload-artifact@v4
+  with:
+    name: page-dump
+    path: |
+      *.png
+      dump/**
+    if-no-files-found: warn
+    retention-days: 7
