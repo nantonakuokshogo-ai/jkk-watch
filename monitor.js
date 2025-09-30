@@ -29,19 +29,39 @@ async function screenshot(page, name) {
   try { await page.screenshot({ path: name, fullPage: true }); } catch {}
 }
 
-/** 404などの「トップページへ戻る」を踏む */
+// 404 や 「おわび」からトップへ戻る
 async function recoverNotFound(page) {
   const title = (await page.title().catch(()=> "")) || "";
-  if (title.includes("見つかりません")) {
-    console.log("[recover] 404 -> トップへ戻る");
-    const link = page.getByRole("link", { name: /トップページへ戻る/ });
-    if (await link.count()) {
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(()=>{}),
-        link.first().click()
-      ]);
-      await page.waitForTimeout(800);
+  if (title.includes("見つかりません") || title.includes("おわび")) {
+    console.log("[recover] notfound/apology -> click 「トップページへ戻る」");
+
+    const clickBack = async (ctx) => {
+      const link = ctx.getByRole("link", { name: /トップページへ戻る/ });
+      if (await link.count()) {
+        await Promise.all([
+          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+          link.first().click()
+        ]);
+        return true;
+      }
+      const btn = ctx.getByRole("button", { name: /トップページへ戻る/ });
+      if (await btn.count()) {
+        await Promise.all([
+          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+          btn.first().click()
+        ]);
+        return true;
+      }
+      return false;
+    };
+
+    // メイン or フレームにある場合もある
+    if (!(await clickBack(page))) {
+      for (const f of page.frames()) {
+        if (await clickBack(f)) break;
+      }
     }
+    await page.waitForTimeout(800);
   }
 }
 
@@ -94,45 +114,61 @@ async function passRelay(page) {
   await page.waitForTimeout(1200);
 }
 
-/** トップページから “空き家情報検索” へリンクを踏む */
+// トップページから “空き家情報検索” へリンクを踏む
 async function enterFromHome(page) {
-  const ok = await gotoRetry(page, HOME);
-  if (!ok) return false;
-  await recoverNotFound(page);
-  await dumpWhere(page, "home");
-  await screenshot(page, "step0-home.png");
-
-  // 1) hrefで直接
-  const hrefLink = page.locator('a[href*="akiyaJyoukenStartInit"]');
-  if (await hrefLink.count()) {
-    console.log('[enter] click link (href*="akiyaJyoukenStartInit")');
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded").catch(()=>{}),
-      hrefLink.first().click()
-    ]);
-    await dumpWhere(page, "after-enter");
-    await screenshot(page, "step1-after-enter.png");
-    return true;
-  }
-
-  // 2) 文言でそれっぽいリンクを探す
-  const candidates = [
-    page.getByRole("link", { name: /空き|空家|あきや|検索|条件/i }),
-    page.getByRole("button", { name: /空き|空家|検索|条件/i })
+  const CANDIDATES = [
+    "https://jhomes.to-kousya.or.jp/",
+    HOME,
+    HOME + "index.html",
+    "https://jhomes.to-kousya.or.jp/search/jkknet/service/"
   ];
-  for (const loc of candidates) {
+
+  const tryClickStart = async (ctx, label) => {
+    // hrefで直接
+    let loc = ctx.locator('a[href*="akiyaJyoukenStartInit"]');
     if (await loc.count()) {
-      console.log("[enter] click alternative link");
+      console.log(`[enter] click link on ${label} (href*="akiyaJyoukenStartInit")`);
       await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(()=>{}),
+        ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
         loc.first().click()
       ]);
-      await dumpWhere(page, "after-enter-alt");
-      await screenshot(page, "step1-after-enter.png");
       return true;
     }
+    // 文言でそれっぽいリンク/ボタン
+    const cands = [
+      ctx.getByRole("link",   { name: /空き|空家|あきや|空室|検索|条件/i }),
+      ctx.getByRole("button", { name: /空き|空家|空室|検索|条件/i })
+    ];
+    for (const l of cands) {
+      if (await l.count()) {
+        console.log(`[enter] click alt on ${label}`);
+        await Promise.all([
+          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+          l.first().click()
+        ]);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const url of CANDIDATES) {
+    if (!(await gotoRetry(page, url))) continue;
+
+    // ← ここで “おわび/見つかりません” を踏んだら戻る
+    await recoverNotFound(page);
+
+    // メイン
+    if (await tryClickStart(page, "main")) return true;
+    // フレーム内に置かれている場合もある
+    for (const f of page.frames()) {
+      if (await tryClickStart(f, `frame:${await f.url()}`)) return true;
+    }
   }
-  return false;
+
+  // だめなら最終手段：Start 直行
+  console.log("[enter] fallback goto START directly");
+  return await gotoRetry(page, "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit");
 }
 
 /** 検索ボタンを押す */
