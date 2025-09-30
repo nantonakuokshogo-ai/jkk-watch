@@ -1,142 +1,218 @@
-// monitor.js
-// Playwright で JKK ねっとの StartInit → 検索ページに POST するまでを実行
-// ESM 前提（package.json の "type":"module" が必要）
+// monitor.js  —— JKK (空き家) リレー専用・popup対応 完全版
+// Node 20 + Playwright (^1.47) 前提
 
 import { chromium } from "playwright";
-import fs from "fs/promises";
-import path from "path";
 
-const BASE = "https://jhomes.to-kousya.or.jp";
-const URLS = [
-  `${BASE}/`,
-  `${BASE}/search/jkknet/`,
-  `${BASE}/search/jkknet/index.html`,
-  `${BASE}/search/jkknet/service/`,
+const HOME_BASE = "https://jhomes.to-kousya.or.jp";
+const HOME_URLS = [
+  `${HOME_BASE}/`,
+  `${HOME_BASE}/search/jkknet/`,
+  `${HOME_BASE}/search/jkknet/index.html`,
+  `${HOME_BASE}/search/jkknet/service/`,
 ];
-const START_INIT = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
+const START_INIT = `${HOME_BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
 
-const DUMP_DIR = "dump";
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
-const NAV_TIMEOUT = 60_000;
-
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true }).catch(() => {});
+// ===== helpers =====
+async function saveShot(p, name) {
+  try { await p.screenshot({ path: `${name}.png`, fullPage: true }); } catch {}
 }
-
-async function saveShot(page, name) {
-  await page.screenshot({ path: `${name}.png`, fullPage: true }).catch(() => {});
+async function saveHtml(p, name) {
+  try { await Bun.write(`${name}.html`, await p.content()); } catch {}
 }
+async function waitIdle(p, ms = 600) {
+  try { await p.waitForTimeout(ms); } catch {}
+}
+const hasText = async (p, pattern) => (await p.content()).includes(pattern);
 
-async function saveHtml(page, name) {
+// 「トップページへ戻る」押下 (おわび/タイムアウト からの復帰)
+async function clickBackToTop(p) {
+  const sel = 'text=トップページへ戻る';
   try {
-    await ensureDir(DUMP_DIR);
-    const html = await page.content();
-    await fs.writeFile(path.join(DUMP_DIR, `${name}.html`), html, "utf8");
-  } catch (e) {
-    console.error("[dump] save error:", e);
-  }
+    const btn = await p.locator(sel).first();
+    if (await btn.count()) {
+      await btn.click({ timeout: 3000 });
+      await p.waitForLoadState('domcontentloaded', { timeout: 8000 });
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
-function logStep(tag, msg) {
-  console.log(`[${tag}] ${msg}`);
-}
-
-function isApologyLike(titleOrText) {
-  if (!titleOrText) return false;
-  const s = String(titleOrText);
+// apology 系を検知
+async function isApology(p) {
+  const html = await p.content();
   return (
-    s.includes("おわび") ||
-    s.includes("混雑") ||
-    s.includes("操作は行わないで") ||
-    s.includes("見つかりません")
+    html.includes("JKKねっと：おわび") ||
+    html.includes("長い間アクセスがなかったため") ||
+    html.includes("ただいま、サーバーが大変混みあっております")
   );
 }
 
-async function gotoWithRetry(page, url, tag) {
-  for (let i = 1; i <= 3; i++) {
+// URL 群を順に試す
+async function gotoWithFallback(page, urls, referrer) {
+  for (const u of urls) {
     try {
-      logStep(tag, `goto try${i}: ${url}`);
-      await page.goto(url, {
-        timeout: NAV_TIMEOUT,
-        waitUntil: "domcontentloaded",
-      });
+      if (referrer) {
+        await page.goto(u, { referer: referrer, timeout: 15000, waitUntil: 'domcontentloaded' });
+      } else {
+        await page.goto(u, { timeout: 15000, waitUntil: 'domcontentloaded' });
+      }
+      console.log("[goto]", u);
+      await waitIdle(page);
+      if (await isApology(page)) {
+        console.log("[recover] apology -> back to top");
+        if (!(await clickBackToTop(page))) continue;
+      }
       return true;
     } catch (e) {
-      logStep(tag, `goto error on try${i}: ${e}`);
-      if (i < 3) await page.waitForTimeout(1500);
+      console.log("[goto-fail]", u, e.message);
     }
   }
   return false;
 }
 
-async function dumpWhere(page, tag) {
-  const title = await page.title().catch(() => "");
-  const url = page.url();
-  console.log(`${tag} URL: ${url}`);
-  console.log(`${tag} TITLE: ${title}`);
-  await saveShot(page, tag.replace(/\W/g, "_"));
-  await saveHtml(page, tag.replace(/\W/g, "_"));
-  return { url, title };
+// 「こちら」クリック (frame or main 両対応)
+async function tryClickKochira(ctx) {
+  // main
+  let target = ctx.locator('text=こちら').first();
+  if (await target.count()) {
+    await target.click({ timeout: 2000 });
+    return true;
+  }
+  // a[href*="#"] の「こちら」ケース
+  target = ctx.locator('a:has-text("こちら")').first();
+  if (await target.count()) {
+    await target.click({ timeout: 2000 });
+    return true;
+  }
+  return false;
 }
 
-async function main() {
-  await ensureDir(DUMP_DIR);
+// forwardForm を popup で submit する (仕様の再現)
+async function submitForwardFormWithPopup(ctxPage) {
+  // ctxPage か、その子 frame のどこかに forwardForm がある想定
+  const getFrameWithForm = async () => {
+    // main
+    if (await ctxPage.evaluate(() => !!document.forwardForm)) return ctxPage.mainFrame();
+    // frames
+    for (const f of ctxPage.frames()) {
+      try {
+        const ok = await f.evaluate(() => !!document.forwardForm).catch(() => false);
+        if (ok) return f;
+      } catch {}
+    }
+    return null;
+  };
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 900 },
-    userAgent: UA,
-    extraHTTPHeaders: { "Accept-Language": "ja,en;q=0.8" },
+  const frame = await getFrameWithForm();
+  if (!frame) return false;
+
+  console.log("[relay] submit forwardForm via popup");
+
+  // popup を待ち受け & window.open + submit を実行
+  const [popup] = await Promise.all([
+    ctxPage.waitForEvent("popup", { timeout: 8000 }),
+    frame.evaluate(() => {
+      // サイトの実装を忠実に再現
+      window.open("/search/jkknet/wait.jsp", "JKKnet");
+      document.forwardForm.target = "JKKnet";
+      document.forwardForm.submit();
+    }),
+  ]).catch(() => [null]);
+
+  if (!popup) {
+    console.log("[relay] popup not opened");
+    return false;
+  }
+
+  // popup 内の遷移を待つ
+  await popup.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+  console.log("[relay] popup URL:", popup.url());
+  await saveShot(popup, "_popup_");
+  await saveHtml(popup, "_popup_");
+
+  // popup がさらに遷移して frameset になる場合あり
+  try {
+    // しばらく待ってメイン側にも変化が出るかを見る
+    await waitIdle(ctxPage, 1000);
+  } catch {}
+
+  return true;
+}
+
+// frameset 直叩きパス (referer=/service/)
+async function directFramesetStart(page) {
+  console.log("[frameset] direct goto StartInit with referer=/service/");
+  await page.goto(START_INIT, {
+    referer: `${HOME_BASE}/search/jkknet/service/`,
+    timeout: 15000,
+    waitUntil: "domcontentloaded",
   });
-  const page = await context.newPage();
+  await waitIdle(page);
+  await saveShot(page, "_frameset_");
+  await saveHtml(page, "_frameset_");
+}
+
+// ===== main =====
+(async () => {
+  const browser = await chromium.launch({
+    headless: true, // GitHub Actions 上は true
+    args: ['--disable-gpu', '--no-sandbox'],
+  });
+  const page = await browser.newPage({ bypassCSP: true });
 
   try {
-    // 1) ホーム/サービスに順番にアクセス
-    for (const u of URLS) {
-      await gotoWithRetry(page, u, "[home]");
-      await dumpWhere(page, "[home]");
-    }
+    // 1) HOME 群に入る
+    const okHome = await gotoWithFallback(page, HOME_URLS);
+    if (!okHome) throw new Error("cannot reach HOME sequence");
 
-    // 2) StartInit 直行
-    await gotoWithRetry(page, START_INIT, "[frameset]");
-    await dumpWhere(page, "[frameset]");
+    await saveShot(page, "_home_");
+    await saveHtml(page, "_home_");
+    console.log("[home] URL:", page.url());
 
-    // 3) frameset 内の form を直接 submit
-    logStep("relay", "try submit forwardForm");
-    const ok = await page.evaluate(() => {
-      const f = document.forms["forwardForm"];
-      if (f) {
-        f.submit();
-        return true;
+    // 2) frameset を直接 (referer 付き) で叩いて form が取れる状態を作る
+    await directFramesetStart(page);
+
+    // 3) 「こちら」を押せるなら一度押す（JS が form を作るケースの起点）
+    let relayed = false;
+    // main
+    if (await tryClickKochira(page)) relayed = true;
+    // frames
+    if (!relayed) {
+      for (const f of page.frames()) {
+        try {
+          if (await tryClickKochira(f)) { relayed = true; break; }
+        } catch {}
       }
-      return false;
-    });
-    if (ok) {
-      logStep("relay", "forwardForm.submit() called");
-      await page.waitForTimeout(3000);
-    } else {
-      logStep("relay", "forwardForm not found");
     }
 
-    // 4) submit 後の画面を保存
-    const step3 = await dumpWhere(page, "[after-submit]");
-    if (isApologyLike(step3.title)) {
-      logStep("result", "apology page detected");
-    } else {
-      logStep("result", "maybe success, check HTML in dump/");
+    await waitIdle(page, 700);
+    await saveShot(page, "_after_relay_");
+    await saveHtml(page, "_after_relay_");
+
+    // 4) 仕様通り popup を開いて forwardForm を submit
+    const submitted = await submitForwardFormWithPopup(page);
+    if (!submitted) {
+      console.log("[relay] fallback: 再度 frameset 直叩き→submit を試行");
+      // もう一度 frameset を作り直して submit 試行
+      await directFramesetStart(page);
+      await waitIdle(page, 500);
+      const submitted2 = await submitForwardFormWithPopup(page);
+      if (!submitted2) throw new Error("forwardForm submit (popup) failed");
     }
 
-    // 5) 最終スクショ
-    await dumpWhere(page, "[final]");
+    // 5) submit 後の状態を保存
+    await waitIdle(page, 800);
+    await saveShot(page, "_after_submit_");
+    await saveHtml(page, "_after_submit_");
+
+    // 6) 最後に見えている URL/TITLE をログ
+    console.log("[final] URL:", page.url());
+    console.log("[final] TITLE:", await page.title());
   } catch (e) {
-    console.error("FATAL:", e);
-    await saveShot(page, "fatal");
-    await saveHtml(page, "fatal");
-    throw e;
+    console.error("ERROR", e);
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
-}
-
-main();
+})();
