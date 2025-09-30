@@ -1,12 +1,40 @@
-// monitor.js  — Playwright 単体で JKK StartInit → 中継突破 → 一覧へ到達する最小ルート
+// monitor.js  — Playwright で JKK ねっとの StartInit → 検索までを機械操作し、
+// スクショと HTML を artifacts に出力します（dump/ 配下）。
+// ESM 前提（package.json の "type":"module"）。
+
 import { chromium } from "playwright";
-// ❶ 先頭の import の下あたりに追加
 import fs from "fs/promises";
 import path from "path";
+
+// ========== 設定 ==========
+const BASE = "https://jhomes.to-kousya.or.jp";
+const URLS = [
+  `${BASE}/`,
+  `${BASE}/search/jkknet/`,
+  `${BASE}/search/jkknet/index.html`,
+  `${BASE}/search/jkknet/service/`,
+];
+const START_INIT = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
+const SHOT_W = 1280;
+const SHOT_H = 900;
 const DUMP_DIR = "dump";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
+const NAV_TIMEOUT = 60_000; // 60s
+const TRY_MAX = 3;
+// =========================
+
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true }).catch(() => {});
+}
+
+async function saveShot(page, name) {
+  await page.screenshot({ path: `${name}.png`, fullPage: true }).catch(() => {});
+}
+
 async function saveHtml(page, name) {
   try {
-    await fs.mkdir(DUMP_DIR, { recursive: true });
+    await ensureDir(DUMP_DIR);
     const html = await page.content();
     await fs.writeFile(path.join(DUMP_DIR, `${name}.html`), html, "utf8");
   } catch (e) {
@@ -14,174 +42,202 @@ async function saveHtml(page, name) {
   }
 }
 
-/* ========================  設定  ======================== */
-const HOME        = "https://jhomes.to-kousya.or.jp/";
-const PORTAL      = "https://jhomes.to-kousya.or.jp/search/jkknet/";
-const INDEX       = "https://jhomes.to-kousya.or.jp/search/jkknet/index.html";
-const FRAMESET    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
-const STARTINIT   = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-const LISTURL     = "https://jhomes.to-kousya.or.jp/search/jkknet/service/AKIYAchangeCount";
+function logStep(tag, msg) {
+  console.log(`[${tag}] ${msg}`);
+}
 
-/* ======================  小物ユーティリティ  ====================== */
-async function saveShot(page, name) {
-  try { await page.screenshot({ path: name, fullPage: true }); } catch {}
+function isApologyLike(titleOrText) {
+  if (!titleOrText) return false;
+  const s = String(titleOrText);
+  return (
+    s.includes("おわび") ||
+    s.includes("大変混雑") ||
+    s.includes("操作は行わないで下さい") ||
+    s.includes("見つかりません")
+  );
 }
-async function saveHtml(page, name) {
-  try { const html = await page.content(); await Bun.write(name, html); } catch {}
-}
-async function dumpFrames(page, name = "debug_frames.txt") {
-  try {
-    const lines = page.frames().map((fr, i) => `[${i}] name=${fr.name() || "(no name)"} url=${fr.url()}`);
-    await Bun.write(name, lines.join("\n"));
-  } catch {}
-}
-async function gotoRetry(page, url, opts = {}) {
-  for (let i = 0; i < 3; i++) {
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000, ...opts });
-      return true;
-    } catch {} // retry
+
+async function clickIfExists(scope, selector) {
+  const el = await scope.$(selector);
+  if (el) {
+    await el.click({ timeout: 2000 }).catch(() => {});
+    return true;
   }
   return false;
 }
-function isApology(titleOrHtml) {
-  return /おわび|ページが見つかりません|タイムアウト|その操作は行わないで下さい/.test(titleOrHtml || "");
-}
-async function recoverApology(page, tag = "recover") {
-  const title = await page.title().catch(()=> "");
-  const html  = await page.content().catch(()=> "");
-  if (!isApology(title) && !isApology(html)) return false;
 
-  console.log(`[${tag}] notfound/apology -> click 「トップページへ戻る」`);
-  // 「トップページへ戻る」を押す（どこにあっても拾う）
-  for (const ctx of [page, ...page.frames()]) {
-    const btn = ctx.getByRole("link", { name: /トップページへ戻る/ });
-    if (await btn.count()) {
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(()=>{}),
-        btn.first().click().catch(()=>{})
-      ]);
-      await page.waitForTimeout(500);
-      break;
-    }
+async function clickKochiraAnywhere(page) {
+  // main
+  const ok1 = await clickIfExists(page, 'a:has-text("こちら")');
+  if (ok1) return true;
+  // frames
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    const ok = await clickIfExists(f, 'a:has-text("こちら")');
+    if (ok) return true;
   }
-  return true;
+  return false;
 }
 
-/* ==============  中継「こちら」を URL 遷移で確実に踏み抜く  ============== */
-async function clickRelaySmart(page) {
-  // 中継は何段か連続することがあるので 5 回まで回す
-  for (let round = 0; round < 5; round++) {
-    let moved = false;
-
-    for (const ctx of [page, ...page.frames()]) {
-      // 「こちら」の a 要素を総当り
-      const anchors = await ctx.locator("a").all().catch(()=>[]);
-      for (const a of anchors) {
-        const text = ((await a.textContent()) || "").trim();
-        if (!/こちら/.test(text)) continue;
-
-        const href = await a.getAttribute("href");
-        if (!href) continue;
-
-        const nextUrl = new URL(href, ctx.url()).toString();
-        console.log(`[relay] goto by href -> ${nextUrl}`);
-
-        await page.goto(nextUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 60_000,
-          referer: FRAMESET, // JKK 的に Referer がないと弾かれがち
-        }).catch(()=>{});
-
-        await page.waitForTimeout(700);
-        moved = true;
-        break;
+async function submitAnyForm(page) {
+  // main
+  const ok1 = await page
+    .evaluate(() => {
+      const f = document.forms?.[0];
+      if (f && typeof f.submit === "function") {
+        f.submit();
+        return true;
       }
-      if (moved) break;
+      return false;
+    })
+    .catch(() => false);
+  if (ok1) return true;
+
+  // frames
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    const ok = await f
+      .evaluate(() => {
+        const fm = document.forms?.[0];
+        if (fm && typeof fm.submit === "function") {
+          fm.submit();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (ok) return true;
+  }
+  return false;
+}
+
+async function gotoWithRetry(page, url, tag, extra = {}) {
+  for (let i = 1; i <= TRY_MAX; i++) {
+    try {
+      logStep(tag, `goto try${i}: ${url}`);
+      await page.goto(url, {
+        timeout: NAV_TIMEOUT,
+        waitUntil: "domcontentloaded",
+        ...extra,
+      });
+      return true;
+    } catch (e) {
+      logStep(tag, `goto error on try${i}: ${e}`);
+      if (i < TRY_MAX) await page.waitForTimeout(1500);
     }
-    if (!moved) break; // もう「こちら」が無ければ終わり
   }
+  return false;
 }
 
-/* ==============  最終フォールバック：一覧へ直行  ============== */
-async function fallbackGotoList(page) {
-  const before = page.url();
-  await page.goto(LISTURL, {
-    waitUntil: "domcontentloaded",
-    timeout: 60_000,
-    referer: STARTINIT,
-  }).catch(()=>{});
-  if (page.url() !== before) {
-    console.log("[fallback] moved to list:", page.url());
-  } else {
-    console.log("[fallback] still same url:", page.url());
-  }
+async function dumpWhere(page, tag) {
+  const title = await page.title().catch(() => "");
+  const url = page.url();
+  console.log(`${tag} URL: ${url}`);
+  console.log(`${tag} TITLE: ${title}`);
+  await saveShot(page, `${tag.replace(/[\[\]\s]/g, "").toLowerCase()}`);
+  await saveHtml(page, `${tag.replace(/[\[\]\s]/g, "").toLowerCase()}`);
+  return { url, title };
 }
 
-/* =======================  主要シーケンス  ======================= */
+async function recoverIfApology(page) {
+  // 「トップページへ戻る」押下で抜けられるケースを拾う
+  const clicked =
+    (await clickIfExists(page, 'a:has-text("トップページへ戻る")')) ||
+    (await clickIfExists(page, 'input[value="トップページへ戻る"]'));
+  if (clicked) {
+    await page.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
 async function main() {
+  await ensureDir(DUMP_DIR);
+
   const browser = await chromium.launch({
     headless: true,
-    args: ["--disable-blink-features=AutomationControlled"],
+    args: ["--disable-dev-shm-usage"],
   });
+
   const context = await browser.newContext({
-    locale: "ja-JP",
-    timezoneId: "Asia/Tokyo",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    viewport: { width: SHOT_W, height: SHOT_H },
+    userAgent: UA,
     extraHTTPHeaders: {
-      "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
-      "Upgrade-Insecure-Requests": "1",
+      "Accept-Language": "ja,en;q=0.8",
     },
   });
+
   const page = await context.newPage();
-  page.setDefaultNavigationTimeout(120_000);
-  page.setDefaultTimeout(120_000);
 
   try {
-    // 0) 入口で何度おわびでも良いので /service/ まで触って Cookie 取得
-    for (const url of [HOME, PORTAL, INDEX, FRAMESET]) {
-      console.log(`goto try1: ${url}`);
-      await gotoRetry(page, url);
-      await recoverApology(page, "recover");
-      console.log(`[home] URL: ${page.url()}`);
-      console.log(`[home] TITLE: ${await page.title()}`);
+    // 1) ホーム/検索トップ/サービスに順番に入る（混雑時は戻るで回避）
+    for (const u of URLS) {
+      await gotoWithRetry(page, u, "[home]");
+      const { title } = await dumpWhere(page, "[home]");
+      if (isApologyLike(title)) {
+        await recoverIfApology(page);
+        await page.waitForTimeout(1000);
+        continue; // 次 URL を試す
+      }
     }
 
-    // 1) StartInit を Referer 付きで直叩き
-    console.log("[frameset] direct goto StartInit with referer=/service/");
-    await gotoRetry(page, STARTINIT, { referer: FRAMESET });
-    console.log("[frameset] URL:", page.url());
-    console.log("[frameset] TITLE:", await page.title());
-    await saveShot(page, "step2-frameset.png");
-    await dumpFrames(page);
-
-    // 2) 中継「こちら」を確実に踏み抜く
-    await clickRelaySmart(page);
-
-    // 3) 念のため Apology を 1 回だけ救済
-    await recoverApology(page, "recover2");
-
-    // 4) まだ StartInit っぽいなら最終フォールバックで一覧へ直行
-    if (/akiyaJyoukenStartInit/i.test(page.url()) || /JKKねっと$/.test(await page.title())) {
-      await fallbackGotoList(page);
+    // 2) StartInit に「Referer: /service/」付きで直行
+    logStep("frameset", "direct goto StartInit with referer=/service/");
+    await gotoWithRetry(page, START_INIT, "[frameset]", {
+      referer: `${BASE}/search/jkknet/service/`,
+    });
+    const step2 = await dumpWhere(page, "[frameset]");
+    if (isApologyLike(step2.title)) {
+      // 一度だけ戻りリカバリを試す
+      const rec = await recoverIfApology(page);
+      if (rec) await gotoWithRetry(page, START_INIT, "[frameset-retry]", { referer: `${BASE}/search/jkknet/service/` });
     }
 
-    // 5) 現状保存
-    console.log("[after-search] URL:", page.url());
-    console.log("[after-search] TITLE:", await page.title());
-    await saveHtml(page, "after-search.html");
-    await saveShot(page, "step3-after-search.png");
+    // 3) 「こちら」を main/frames どちらでも押す → それでもダメなら meta refresh 直行を試す
+    logStep("relay", 'click "こちら" if appears');
+    for (let i = 0; i < 4; i++) {
+      const ok = await clickKochiraAnywhere(page);
+      if (!ok) break;
+      await page.waitForTimeout(1500);
+    }
+    await dumpWhere(page, "[after-relay]");
 
-    // 6) 最終スクショ（見やすい名前）
-    await saveShot(page, "out.png");
+    // 最終手段：meta refresh があれば飛ぶ
+    try {
+      const refresh = await page.$('meta[http-equiv="refresh" i]');
+      if (refresh) {
+        const content = await refresh.getAttribute("content");
+        const m = content && content.match(/URL=([^;]+)/i);
+        if (m && m[1]) {
+          const next = new URL(m[1], page.url()).toString();
+          logStep("relay", `meta refresh → ${next}`);
+          await gotoWithRetry(page, next, "[relay-meta]");
+        }
+      }
+    } catch {}
 
+    // 4) 何かしらフォームがあれば submit（検索発火）
+    logStep("search", "try submit any first form on main/frames");
+    await submitAnyForm(page);
+    await page.waitForTimeout(1500);
+    await dumpWhere(page, "[after-search]");
+
+    // ここで “物件一覧/検索結果” に到達できれば HTML から DOM 解析へ進めます
+    // まだ「おわび」や StartInit のままなら、現状はここまで（dump を根拠に次のクリックを合わせる）
+    const final = await dumpWhere(page, "[final]");
+    if (isApologyLike(final.title)) {
+      logStep("result", "apology page detected — 次回のクリック/遷移調整が必要");
+    } else {
+      logStep("result", "OK（この HTML をもとに結果抽出の実装に進めます）");
+    }
+  } catch (e) {
+    console.error("FATAL:", e);
+    await saveShot(page, "fatal");
+    await saveHtml(page, "fatal");
+    throw e;
   } finally {
     await browser.close();
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+main();
