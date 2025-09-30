@@ -1,182 +1,164 @@
 import { chromium } from "playwright";
 
-/* ===================== 設定 ===================== */
+/* ============ 設定 ============ */
 const HOME = "https://jhomes.to-kousya.or.jp/search/jkknet/";
-const START = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-const KEYWORD = "DK"; // ←動作確認用。OKになったら本命に変更
-/* ================================================= */
+const KEYWORD = "DK"; // 動作確認用。OKなら本命に変更
+/* ============================ */
 
-async function goto(page, url, tries = 3) {
+async function gotoRetry(page, url, tries = 3) {
   for (let i = 1; i <= tries; i++) {
     try {
       console.log(`goto try${i}: ${url}`);
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
       return true;
     } catch (e) {
-      console.log("goto fail:", e.message);
+      console.log(`goto fail${i}:`, e.message);
       await page.waitForTimeout(1200);
     }
   }
   return false;
 }
 
-/* ---------- 404（ページが見つかりません）からの復帰 ---------- */
-async function recoverIfNotFound(page) {
-  const title = (await page.title().catch(() => "")) || "";
+async function dumpWhere(page, label) {
+  const title = await page.title().catch(() => "");
+  console.log(`[${label}] URL: ${page.url()}`);
+  console.log(`[${label}] TITLE: ${title}`);
+}
+
+async function screenshot(page, name) {
+  try { await page.screenshot({ path: name, fullPage: true }); } catch {}
+}
+
+/** 404などの「トップページへ戻る」を踏む */
+async function recoverNotFound(page) {
+  const title = (await page.title().catch(()=> "")) || "";
   if (title.includes("見つかりません")) {
-    console.log('[recover] not found -> click 「トップページへ戻る」');
+    console.log("[recover] 404 -> トップへ戻る");
     const link = page.getByRole("link", { name: /トップページへ戻る/ });
     if (await link.count()) {
       await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(() => {}),
+        page.waitForLoadState("domcontentloaded").catch(()=>{}),
         link.first().click()
       ]);
       await page.waitForTimeout(800);
+    }
+  }
+}
+
+/** 中継ページの「こちら」や meta refresh を処理 */
+async function passRelay(page) {
+  console.log("[relay] start");
+  // 1) “こちら” をクリック（メイン/フレーム）
+  const clickHereOn = async (ctx, label) => {
+    const here = ctx.getByRole("link", { name: /こちら/ });
+    if (await here.count()) {
+      console.log(`[relay] click "${label}" -> こちら`);
+      await Promise.all([
+        ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+        here.first().click({ timeout: 3000 })
+      ]);
       return true;
     }
-    const btn = page.getByRole("button", { name: /トップページへ戻る/ });
-    if (await btn.count()) {
+    return false;
+  };
+  if (await clickHereOn(page, "main")) { await page.waitForTimeout(1000); return; }
+  for (const f of page.frames()) {
+    if (await clickHereOn(f, `frame:${await f.url()}`)) { await page.waitForTimeout(1000); return; }
+  }
+
+  // 2) meta refresh を拾う（メイン/フレーム）
+  const tryMeta = async (ctx, label) => {
+    try {
+      const html = await ctx.content();
+      const m = html.match(/http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)/i);
+      if (m && m[1]) {
+        let target = m[1];
+        const base = new URL(ctx.url ? await ctx.url() : page.url());
+        if (!/^https?:\/\//i.test(target)) {
+          target = target.startsWith("/")
+            ? `${base.origin}${target}`
+            : `${base.origin}${base.pathname.replace(/\/[^/]*$/, "/")}${target}`;
+        }
+        console.log(`[relay] meta refresh from ${label}: ${target}`);
+        await page.goto(target, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
+        await page.waitForTimeout(800);
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+  if (await tryMeta(page, "main")) return;
+  for (const f of page.frames()) { if (await tryMeta(f, `frame:${await f.url()}`)) return; }
+
+  // 3) 少し待機（自動遷移待ち）
+  await page.waitForTimeout(1200);
+}
+
+/** トップページから “空き家情報検索” へリンクを踏む */
+async function enterFromHome(page) {
+  const ok = await gotoRetry(page, HOME);
+  if (!ok) return false;
+  await recoverNotFound(page);
+  await dumpWhere(page, "home");
+  await screenshot(page, "step0-home.png");
+
+  // 1) hrefで直接
+  const hrefLink = page.locator('a[href*="akiyaJyoukenStartInit"]');
+  if (await hrefLink.count()) {
+    console.log('[enter] click link (href*="akiyaJyoukenStartInit")');
+    await Promise.all([
+      page.waitForLoadState("domcontentloaded").catch(()=>{}),
+      hrefLink.first().click()
+    ]);
+    await dumpWhere(page, "after-enter");
+    await screenshot(page, "step1-after-enter.png");
+    return true;
+  }
+
+  // 2) 文言でそれっぽいリンクを探す
+  const candidates = [
+    page.getByRole("link", { name: /空き|空家|あきや|検索|条件/i }),
+    page.getByRole("button", { name: /空き|空家|検索|条件/i })
+  ];
+  for (const loc of candidates) {
+    if (await loc.count()) {
+      console.log("[enter] click alternative link");
       await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(() => {}),
-        btn.first().click()
+        page.waitForLoadState("domcontentloaded").catch(()=>{}),
+        loc.first().click()
       ]);
-      await page.waitForTimeout(800);
+      await dumpWhere(page, "after-enter-alt");
+      await screenshot(page, "step1-after-enter.png");
       return true;
     }
   }
   return false;
 }
 
-/* ---------- HOME → StartInit を“リンク踏み”で入る ---------- */
-async function enterFromHome(page) {
-  const CANDIDATES = [
-    HOME,
-    HOME + "index.html",
-    "https://jhomes.to-kousya.or.jp/search/jkknet/service/"
-  ];
-
-  for (const url of CANDIDATES) {
-    if (!(await goto(page, url))) continue;
-    await recoverIfNotFound(page);
-
-    const byHref = page.locator('a[href*="akiyaJyoukenStartInit"]');
-    if (await byHref.count()) {
-      console.log('[enter] click link to StartInit (href*="akiyaJyoukenStartInit")');
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(() => {}),
-        byHref.first().click()
-      ]);
-      return true;
-    }
-    const alt = page.getByRole("link", { name: /空き|空家|検索|条件|JKKねっと/i });
-    if (await alt.count()) {
-      console.log("[enter] click alternative link from HOME");
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(() => {}),
-        alt.first().click()
-      ]);
-      return true;
-    }
-  }
-
-  // 最終手段：Startへ直行
-  console.log("[enter] fallback goto START directly");
-  return await goto(page, START);
-}
-
-/* ---------- 中継ページ「こちら」を突破（href→meta→クリック） ---------- */
-async function passRelay(page) {
-  console.log("[relay] start");
-
-  const absolutize = (baseUrl, href) => {
-    if (!href) return null;
-    if (/^https?:\/\//i.test(href)) return href;
-    const base = new URL(baseUrl);
-    return href.startsWith("/")
-      ? `${base.origin}${href}`
-      : `${base.origin}${base.pathname.replace(/\/[^/]*$/, "/")}${href}`;
-  };
-
-  const tryCtx = async (ctx, label) => {
-    try {
-      const html = await ctx.content();
-
-      // a ...>こちら</a>
-      let m = html.match(/<a[^>]+href=["']([^"']+)["'][^>]*>[\s\S]*?こちら[\s\S]*?<\/a>/i);
-      if (m && m[1]) {
-        const abs = absolutize(ctx.url ? await ctx.url() : page.url(), m[1]);
-        console.log(`[relay] parse href from ${label}: ${abs}`);
-        await page.goto(abs, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-        return true;
-      }
-
-      // <meta http-equiv="refresh" content="...;url=...">
-      m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)/i);
-      if (m && m[1]) {
-        const abs = absolutize(ctx.url ? await ctx.url() : page.url(), m[1]);
-        console.log(`[relay] meta refresh from ${label}: ${abs}`);
-        await page.goto(abs, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-        return true;
-      }
-    } catch {}
-    return false;
-  };
-
-  if (await tryCtx(page, "main")) { /* ok */ }
-  else {
-    for (const f of page.frames()) {
-      if (await tryCtx(f, `frame:${await f.url()}`)) break;
-    }
-    // 最後に強制クリック（保険）
-    const here = page.locator("text=こちら");
-    if (await here.count()) {
-      console.log("[relay] force click");
-      await Promise.all([
-        page.waitForLoadState("domcontentloaded").catch(() => {}),
-        here.first().click({ force: true })
-      ]);
-    }
-  }
-
-  await page.waitForTimeout(1200);
-  console.log("[relay] after, URL:", page.url());
-  for (const f of page.frames()) console.log("[relay] frame:", await f.url());
-}
-
-/* ---------- おわびページに落ちたら復帰 ---------- */
-async function recoverIfApology(page) {
-  const title = (await page.title().catch(() => "")) || "";
-  if (title.includes("おわび") || page.url().endsWith("/service/#")) {
-    console.log("[recover] apology page -> re-enter from HOME");
-    await enterFromHome(page);
-    await passRelay(page);
-  }
-}
-
-/* ---------- 検索ボタンクリック ---------- */
+/** 検索ボタンを押す */
 async function pressSearch(page) {
-  const tryOn = async (ctx, desc) => {
+  const tryOn = async (ctx, label) => {
     const main = ctx.getByRole("button", { name: /^検索$/ });
     if (await main.count()) {
-      console.log(`[search] click (${desc}) "検索"`);
+      console.log(`[search] click (${label}) "検索"`);
       await Promise.all([
-        ctx.waitForLoadState("domcontentloaded").catch(() => {}),
-        main.first().click({ timeout: 3000 })
+        ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+        main.first().click({ timeout: 4000 })
       ]);
       return true;
     }
-    const cand = [
-      ctx.getByRole("button", { name: /空き|検索|次へ|同意|OK/ }),
-      ctx.getByRole("link",   { name: /空き|検索/ }),
+    const fallbacks = [
+      ctx.getByRole("button", { name: /検索|空き|空家|次へ|同意|OK/ }),
+      ctx.getByRole("link",   { name: /検索|空き|空家/ }),
       ctx.getByText("検索", { exact: true })
     ];
-    for (const loc of cand) {
+    for (const loc of fallbacks) {
       if (await loc.count()) {
-        console.log(`[search] click (${desc}) fallback`);
+        console.log(`[search] click fallback (${label})`);
         try {
           await Promise.all([
-            ctx.waitForLoadState("domcontentloaded").catch(() => {}),
-            loc.first().click({ timeout: 3000 })
+            ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+            loc.first().click({ timeout: 4000 })
           ]);
           return true;
         } catch {}
@@ -190,17 +172,17 @@ async function pressSearch(page) {
   return false;
 }
 
-/* ---------- 一覧で「50件」選択（あれば） ---------- */
+/** 一覧で「50件」を選ぶ（あれば） */
 async function setPageSize50(page) {
-  const tryOn = async (ctx, desc) => {
+  const tryOn = async (ctx, label) => {
     const selects = ctx.locator("select");
     const n = await selects.count();
     for (let i = 0; i < n; i++) {
       try {
         await selects.nth(i).selectOption({ label: "50" });
-        console.log(`[pagesize] set 50 on ${desc}`);
+        console.log(`[pagesize] set 50 on ${label}`);
         const apply = ctx.getByRole("button", { name: /表示|再表示|検索|反映/ });
-        if (await apply.count()) await apply.first().click().catch(() => {});
+        if (await apply.count()) await apply.first().click().catch(()=>{});
         return true;
       } catch {}
     }
@@ -211,49 +193,67 @@ async function setPageSize50(page) {
   return false;
 }
 
-/* ===================== メイン ===================== */
+/** “おわび”や“その操作は…”に落ちたらホームからやり直し（1回だけ） */
+async function recoverApologyOnce(page, flag) {
+  const title = (await page.title().catch(()=> "")) || "";
+  if (!flag.used && (title.includes("おわび") || title.includes("その操作は行わないで下さい") || page.url().endsWith("/service/#"))) {
+    console.log("[recover] apology/operation error -> re-enter once");
+    flag.used = true;
+    const ok = await enterFromHome(page);
+    if (ok) await passRelay(page);
+  }
+}
+
+/* ============ メイン ============ */
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
   });
 
   try {
-    // ① HOME から入る（404を踏んだら戻る）→ ② 中継「こちら」
+    // 1) トップ → 空き家情報検索（リンク踏み）
     const entered = await enterFromHome(page);
-    if (!entered) throw new Error("cannot find StartInit link from HOME");
+    if (!entered) throw new Error("cannot find link from HOME");
+
+    // 2) 中継ページ「こちら」 or meta refresh
     await passRelay(page);
+    await dumpWhere(page, "after-relay");
+    await screenshot(page, "step2-after-relay.png");
 
-    // ③ おわびに落ちたら復帰
-    await recoverIfApology(page);
+    // 3) おわび/操作エラーなら1回だけ再入場
+    const once = { used: false };
+    await recoverApologyOnce(page, once);
 
-    // ④ 検索ボタン（最大2回試す／途中でおわびなら復帰）
+    // 4) 検索ボタン（最大2回試す）
     for (let i = 0; i < 2; i++) {
       const ok = await pressSearch(page);
       await page.waitForTimeout(1000);
-      await recoverIfApology(page);
+      await recoverApologyOnce(page, once);
       if (ok) break;
     }
+    await dumpWhere(page, "after-search");
+    await screenshot(page, "step3-after-search.png");
 
-    // ⑤（あれば）50件
+    // 5) 可能なら 50件表示へ
     await setPageSize50(page);
     await page.waitForTimeout(800);
 
-    // ⑥ 判定 & スクショ
+    // 6) キーワード検出
     let hit = false;
     for (const ctx of [page, ...page.frames()]) {
-      const html = await ctx.content().catch(() => "");
+      const html = await ctx.content().catch(()=> "");
       if (html.includes(KEYWORD)) { hit = true; break; }
     }
     console.log(hit ? "HIT" : "not found");
 
-    console.log("URL:", page.url());
-    try { console.log("TITLE:", await page.title()); } catch {}
-    await page.screenshot({ path: "out.png", fullPage: true }).catch(() => {});
+    // 7) 最終ログ＆スクショ
+    await dumpWhere(page, "final");
+    await screenshot(page, "out.png");
+
   } catch (e) {
     console.error("ERROR", e);
-    try { await page.screenshot({ path: "out.png", fullPage: true }); } catch {}
+    try { await screenshot(page, "out.png"); } catch {}
     process.exitCode = 1;
   } finally {
     await browser.close();
