@@ -1,31 +1,38 @@
-name: JKK Watch (smoke test)
+name: run
+
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'monitor.js'
+      - '.github/workflows/jkk.yml'
+      - 'package.json'
+      - 'package-lock.json'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install deps
-        run: |
-          npm i -D playwright
-          npx playwright install --with-deps chromium
+        run: npm ci
 
       - name: Run
         run: node monitor.js
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: page-screenshot
-          path: |
-            *.png
-            *.html
+          name: out
+          path: out/**
