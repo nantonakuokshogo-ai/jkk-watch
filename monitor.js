@@ -30,24 +30,41 @@ async function gotoWithRetry(page, url, tries = 3) {
 }
 
 async function clickCandidates(ctx) {
+  // ★まず「検索」ボタンを最優先でクリック
+  const searchBtn = ctx.getByRole('button', { name: /検索/ });
+  if (await searchBtn.count()) {
+    try {
+      await Promise.all([
+        ctx.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(()=>{}),
+        searchBtn.first().click({ timeout: 2000 })
+      ]);
+      console.log("検索ボタンをクリックしました");
+      return;
+    } catch (e) {
+      console.log("検索クリック失敗", e.message);
+    }
+  }
+
+  // それ以外の候補も試す
   const roles = [
-    ['link',   /空き|検索|次へ|同意|OK/i],
-    ['button', /空き|検索|次へ|同意|OK/i],
+    ['link',   /空き|次へ|同意|OK/i],
+    ['button', /空き|次へ|同意|OK/i],
   ];
   for (const [role, name] of roles) {
     const loc = ctx.getByRole(role, { name });
-    if (await loc.count()) { try { await loc.first().click({ timeout: 2000 }); } catch {} }
-  }
-  // service配下のa[href]も少し試す
-  const anchors = ctx.locator('a[href]');
-  const n = await anchors.count();
-  for (let i = 0; i < Math.min(n, 20); i++) {
-    const href = await anchors.nth(i).getAttribute('href');
-    if (href && href !== '#' && /\/search\/jkknet\/service\//i.test(href)) {
-      try { await anchors.nth(i).click({ timeout: 2000 }); break; } catch {}
+    if (await loc.count()) {
+      try {
+        await Promise.all([
+          ctx.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(()=>{}),
+          loc.first().click({ timeout: 2000 })
+        ]);
+        console.log("クリック:", role, name);
+        return;
+      } catch {}
     }
   }
 }
+
 
 async function setPageSize50(ctx) {
   const selects = ctx.locator('select');
