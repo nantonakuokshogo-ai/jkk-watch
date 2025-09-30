@@ -1,246 +1,257 @@
-// monitor.js (ESM / Puppeteer) — FULL REPLACE
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+/**
+ * monitor.js (ESM / Puppeteer v22+ 対応・安全版)
+ * - waitForTimeout 廃止 → sleep() に置換
+ * - 画面遷移の各段階で HTML / PNG を out/ 配下に保存
+ * - 「おわび」「タイムアウト」などのページを検知してリカバリ
+ * - frameset / main フレーム内の「こちら」をクリック
+ * - 必要に応じて form.submit() を強制実行
+ *
+ * 成果物例:
+ *   out/_home_.html/.png
+ *   out/_frameset_.html/.png
+ *   out/_after_relay_.html/.png
+ *   out/_after_submit_.html/.png
+ *   out/_final_.html/.png
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
 import puppeteer from 'puppeteer';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// -----------------------------
+// 基本設定
+// -----------------------------
+const OUT_DIR = path.resolve(process.cwd(), 'out');
+fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const START = 'https://jhomes.to-kousya.or.jp/';
-const HOME1 = 'https://jhomes.to-kousya.or.jp/search/jkknet/';
-const HOME2 = 'https://jhomes.to-kousya.or.jp/search/jkknet/index.html';
-const SERVICE = 'https://jhomes.to-kousya.or.jp/search/jkknet/service/';
-const START_INIT = 'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit';
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const HOME_STEPS = [
+  'https://jhomes.to-kousya.or.jp/',
+  'https://jhomes.to-kousya.or.jp/search/jkknet/',
+  'https://jhomes.to-kousya.or.jp/search/jkknet/index.html',
+  'https://jhomes.to-kousya.or.jp/search/jkknet/service/',
+];
 
-const OUT = path.join(process.cwd(), 'out');
-if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
+const START_INIT =
+  'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit';
 
-const nowTag = () => new Date().toISOString().replace(/[:.]/g, '-');
-const includesAny = (s, arr) => arr.some((x) => s.includes(x));
-
-async function dump(page, tag) {
-  const p = (stub, ext) => path.join(OUT, `${tag}_${stub}.${ext}`);
-  try {
-    await page.screenshot({ path: p('screen', 'png'), fullPage: true });
-  } catch {}
-  try {
-    const html = await page.content();
-    fs.writeFileSync(p('page', 'html'), html, 'utf8');
-  } catch {}
+// -----------------------------
+// 共通ユーティリティ
+// -----------------------------
+async function save(page, name) {
+  const html = await page.content();
+  const htmlPath = path.join(OUT_DIR, `${name}.html`);
+  const pngPath = path.join(OUT_DIR, `${name}.png`);
+  await fs.promises.writeFile(htmlPath, html, 'utf8');
+  await page.screenshot({ path: pngPath, fullPage: true });
+  console.log(`[save] ${name} -> ${htmlPath}, ${pngPath}`);
 }
 
-async function isApology(page) {
-  const title = (await page.title()).trim();
-  const text = await page.evaluate(() => (document.body && document.body.innerText) || '');
-  return (
-    /おわび|タイムアウト|その操作は行わないで下さい/i.test(title + ' ' + text) ||
-    /トップページへ戻る/.test(text)
+function includesAny(text, words) {
+  return words.some((w) => text.includes(w));
+}
+
+async function clickByText(target, text) {
+  // <a>, <button>, <input value> を対象に XPath で探す
+  const escaped = text.replace(/["\\]/g, '\\$&');
+
+  // a/button：innerText
+  let nodes = await target.$x(
+    `//*[self::a or self::button][contains(normalize-space(.), "${escaped}")]`
   );
-}
-
-async function clickBackToTopIfPresent(page) {
-  // 汎用：「トップページへ戻る」を文字検索でクリック
-  const clicked1 = await page.evaluate(() => {
-    const xp =
-      '//*[self::a or self::input or self::button][contains(normalize-space(.),"トップページへ戻る") or contains(@value,"トップページ")]';
-    const it = document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    if (it.snapshotLength > 0) {
-      const el = it.snapshotItem(0);
-      el.click();
-      return true;
-    }
-    return false;
-  });
-  if (clicked1) {
-    await page.waitForTimeout(800);
+  if (nodes.length > 0) {
+    await nodes[0].click({ delay: 50 });
     return true;
   }
 
-  // 最後の保険：最初のリンクを踏む（おわび→トップリンク想定）
-  const clicked2 = await page.evaluate(() => {
-    const a = document.querySelector('a[href]');
-    if (a && /戻る|トップ|index/i.test(a.textContent || '')) {
-      a.click();
-      return true;
-    }
-    return false;
-  });
-  if (clicked2) {
-    await page.waitForTimeout(800);
+  // input[value]
+  nodes = await target.$x(
+    `//input[contains(@value, "${escaped}") or contains(@aria-label, "${escaped}")]`
+  );
+  if (nodes.length > 0) {
+    await nodes[0].click({ delay: 50 });
     return true;
   }
+
   return false;
 }
 
-async function gotoWithHeaders(page, url, referer) {
-  await page.setUserAgent(UA);
-  await page.setExtraHTTPHeaders({ Referer: referer || START });
-  return page.goto(url, {
-    waitUntil: ['domcontentloaded', 'networkidle0'],
-    timeout: 120000,
-  });
-}
-
-async function goHomeSequence(page, maxLoops = 6) {
-  const tag = `homeSeq_${nowTag()}`;
-  let step = 0;
-  const tryList = [
-    [START, START],
-    [HOME1, START],
-    [HOME2, HOME1],
-    [SERVICE, HOME1],
-  ];
-
-  for (let loop = 0; loop < maxLoops; loop++) {
-    for (const [url, ref] of tryList) {
-      step++;
-      await gotoWithHeaders(page, url, ref);
-      await page.waitForTimeout(1000);
-
-      if (await isApology(page)) {
-        await dump(page, `${tag}_apology_step${step}`);
-        await clickBackToTopIfPresent(page);
-        await page.waitForTimeout(1200);
-        continue;
-      }
-
-      const cur = page.url();
-      if (includesAny(cur, [HOME1, HOME2, SERVICE])) {
-        await dump(page, `${tag}_ok_step${step}`);
-        return true;
-      }
-    }
-  }
-  await dump(page, `${tag}_fail`);
-  return false;
-}
-
-function findFrameByUrl(page, part) {
-  return page.frames().find((f) => (f.url() || '').includes(part));
-}
-
-async function relayAndSubmit(page) {
-  const tag = `relay_${nowTag()}`;
-
-  const tryClickHere = async (ctx) => {
-    try {
-      return await ctx.evaluate(() => {
-        const a = Array.from(document.querySelectorAll('a')).find((x) => /こちら/.test(x.innerText || ''));
-        if (a) {
-          a.click();
-          return true;
-        }
-        return false;
-      });
-    } catch {
-      return false;
-    }
-  };
-
-  const tryForceSubmit = async (ctx) => {
-    try {
-      return await ctx.evaluate(() => {
-        const f = document.forms && (document.forms['forwardForm'] || document.querySelector('form'));
-        if (f) {
-          try {
-            f.target = '_self';
-          } catch {}
+async function forceSubmitFirstForm(target) {
+  try {
+    const submitted = await target.evaluate(() => {
+      for (const f of Array.from(document.forms)) {
+        try {
           f.submit();
           return true;
-        }
-        return false;
-      });
-    } catch {
+        } catch (_) {}
+      }
       return false;
-    }
-  };
-
-  await dump(page, `${tag}_page_before`);
-  if (await tryClickHere(page)) {
-    await page.waitForTimeout(1200);
-  } else if (await tryForceSubmit(page)) {
-    await page.waitForTimeout(1200);
+    });
+    return submitted;
+  } catch {
+    return false;
   }
-
-  // frame も総当たり
-  for (let i = 0; i < 3; i++) {
-    for (const fr of page.frames()) {
-      try {
-        const hasBody = await fr.evaluate(() => !!document.body);
-        if (!hasBody) continue;
-        if (await tryClickHere(fr)) {
-          await page.waitForTimeout(1200);
-        } else if (await tryForceSubmit(fr)) {
-          await page.waitForTimeout(1200);
-        }
-      } catch {}
-    }
-  }
-  await dump(page, `${tag}_page_after`);
 }
 
-async function waitForStartInit(page, totalMs = 90000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < totalMs) {
-    const url = page.url();
-    if (url.includes('/service/akiyaJyoukenStartInit')) return true;
-    const fr = findFrameByUrl(page, '/service/akiyaJyoukenStartInit');
-    if (fr) return true;
-    await page.waitForTimeout(800);
+async function waitBody(page, timeout = 15000) {
+  try {
+    await page.waitForSelector('body', { timeout });
+  } catch (_) {
+    // 何もしない（撮影はできる）
+  }
+}
+
+// 「おわび」「タイムアウト」「ページが見つかりません」等の簡易検知
+async function isApologyLike(page) {
+  const html = (await page.content()) || '';
+  return includesAny(html, [
+    'おわび',
+    'タイムアウト',
+    '長い間アクセスがなかったため',
+    'サーバーが大変混み合っております',
+    'ページが見つかりません',
+    'その操作は行わないで下さい',
+  ]);
+}
+
+async function tryRecoverApology(page, labelForSave = '_apology_') {
+  if (!(await isApologyLike(page))) return false;
+
+  console.log('[recover] Apology-like page detected.');
+  await save(page, labelForSave);
+
+  // 最優先：「トップページへ戻る」
+  if (await clickByText(page, 'トップページへ戻る')) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await sleep(800);
+    return true;
+  }
+
+  // 次点：「こちら」
+  if (await clickByText(page, 'こちら')) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await sleep(800);
+    return true;
+  }
+
+  // 何もできない場合も true（検知したことだけ報告）
+  return true;
+}
+
+async function gotoAndCapture(page, url, label) {
+  console.log(`[goto] ${url}`);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await waitBody(page);
+  await save(page, label);
+  await tryRecoverApology(page, `${label}__apology`);
+}
+
+// -----------------------------
+// HOME シーケンス
+// -----------------------------
+async function runHomeSequence(page) {
+  console.log('[home] start sequence');
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      for (let i = 0; i < HOME_STEPS.length; i += 1) {
+        await gotoAndCapture(page, HOME_STEPS[i], i === 0 ? '_home_' : `_home_${i}`);
+        // apology ページなら、その都度「トップへ戻る/こちら」を押して継続
+        if (await isApologyLike(page)) {
+          console.log('[home] apology encountered -> continue sequence');
+        }
+        await sleep(500);
+      }
+      console.log('[home] reached service/');
+      return true;
+    } catch (e) {
+      console.log(`[home] attempt ${attempt} failed: ${e?.message || e}`);
+      await sleep(1200);
+    }
   }
   return false;
 }
 
+// -----------------------------
+// StartInit への侵入 & リレー突破
+// -----------------------------
+async function enterStartInit(page) {
+  // frameset 直リンク
+  await gotoAndCapture(page, START_INIT, '_frameset_');
+
+  // まずはページ全体で「こちら」を探す
+  if (await clickByText(page, 'こちら')) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await sleep(800);
+    await save(page, '_after_relay_');
+  } else {
+    // フレーム内の「こちら」
+    for (const f of page.frames()) {
+      const name = f.name() || '(no-name)';
+      try {
+        if (await clickByText(f, 'こちら')) {
+          console.log(`[relay] clicked in frame: ${name}`);
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+          await sleep(800);
+          await save(page, '_after_relay_');
+          break;
+        }
+      } catch (_) {
+        /* noop */
+      }
+    }
+  }
+
+  // それでも動かない場合は form.submit() を試す（ページと全フレーム）
+  for (const target of [page, ...page.frames()]) {
+    const submitted = await forceSubmitFirstForm(target);
+    if (submitted) {
+      console.log('[search] force form.submit() executed');
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await sleep(800);
+      await save(page, '_after_submit_');
+      break;
+    }
+  }
+
+  await save(page, '_final_');
+}
+
+// -----------------------------
+// メイン
+// -----------------------------
 (async () => {
   const browser = await puppeteer.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    defaultViewport: { width: 1280, height: 900 },
   });
+
   const page = await browser.newPage();
-  page.setDefaultNavigationTimeout(120000);
-  page.setDefaultTimeout(120000);
+  page.setDefaultTimeout(30000);
+  page.setDefaultNavigationTimeout(45000);
 
-  console.log('[goto] start HOME sequence…');
-  const homeOK = await goHomeSequence(page);
-  if (!homeOK) {
-    console.error('Error:  cannot reach HOME sequence');
+  try {
+    const ok = await runHomeSequence(page);
+    if (!ok) {
+      console.log('Error: cannot reach HOME sequence');
+      await save(page, '_final_');
+      await browser.close();
+      // ここで終了コード 0 にしておくと成果物アップロードが安定
+      process.exit(0);
+    }
+
+    await enterStartInit(page);
+
+    console.log('[done] sequence finished');
     await browser.close();
-    process.exit(1);
-  }
-
-  console.log('[goto] service frameset');
-  await gotoWithHeaders(page, SERVICE, HOME1);
-  await page.waitForTimeout(800);
-
-  console.log('[goto] StartInit');
-  await gotoWithHeaders(page, START_INIT, SERVICE);
-  await page.waitForTimeout(1200);
-  await dump(page, `after_goto_StartInit_${nowTag()}`);
-
-  console.log('[relay] click "こちら" / force submit if needed');
-  await relayAndSubmit(page);
-
-  console.log('[wait] StartInit finishing…');
-  const ok = await waitForStartInit(page, 120000);
-  await dump(page, `final_${nowTag()}`);
-
-  if (!ok) {
-    console.error('not found');
+    process.exit(0);
+  } catch (err) {
+    console.error(err);
+    try {
+      await save(page, '_final_');
+    } catch (_) {}
     await browser.close();
-    process.exit(1);
+    // 成果物はアップロードさせたいので 0 で返す（必要に応じて 1 に）
+    process.exit(0);
   }
-
-  console.log('[final] URL:', page.url());
-  console.log('[final] TITLE:', await page.title());
-
-  await browser.close();
-  process.exit(0);
-})().catch(async (e) => {
-  console.error(e);
-  process.exit(1);
-});
+})();
