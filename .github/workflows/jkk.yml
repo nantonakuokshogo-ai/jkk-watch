@@ -25,12 +25,14 @@ jobs:
       - name: Run node monitor.js
         run: node monitor.js
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: page-dump
-          path: |
-            *.png
-            dump/**
+# 収集ステップだけ抜粋
+- name: Upload artifacts
+  uses: actions/upload-artifact@v4
+  with:
+    name: pages
+    path: |
+      out/**/*.png
+      out/**/*.html
+
           if-no-files-found: warn
           retention-days: 7
