@@ -1,5 +1,4 @@
 name: JKK Watch (smoke test)
-
 on:
   workflow_dispatch:
 
@@ -7,10 +6,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -19,21 +16,16 @@ jobs:
 
       - name: Install deps
         run: |
-          npm ci || npm i
+          npm i -D playwright
           npx playwright install --with-deps chromium
 
-      - name: Run node monitor.js
+      - name: Run
         run: node monitor.js
 
-# 収集ステップだけ抜粋
-- name: Upload artifacts
-  uses: actions/upload-artifact@v4
-  with:
-    name: pages
-    path: |
-      out/**/*.png
-      out/**/*.html
-
-
-          if-no-files-found: warn
-          retention-days: 7
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-screenshot
+          path: |
+            *.png
+            *.html
