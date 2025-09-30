@@ -156,57 +156,60 @@ async function directFramesetStart(page) {
 // ===== main =====
 (async () => {
   const browser = await chromium.launch({
-    headless: true, // GitHub Actions 上は true
+    headless: true,
     args: ['--disable-gpu', '--no-sandbox'],
   });
   const page = await browser.newPage({ bypassCSP: true });
 
   try {
-    // 1) HOME 群に入る
-    const okHome = await gotoWithFallback(page, HOME_URLS);
-    if (!okHome) throw new Error("cannot reach HOME sequence");
-
-    await saveShot(page, "_home_");
-    await saveHtml(page, "_home_");
-    console.log("[home] URL:", page.url());
-
-    // 2) frameset を直接 (referer 付き) で叩いて form が取れる状態を作る
-    await directFramesetStart(page);
-
-    // 3) 「こちら」を押せるなら一度押す（JS が form を作るケースの起点）
-    let relayed = false;
-    // main
-    if (await tryClickKochira(page)) relayed = true;
-    // frames
-    if (!relayed) {
-      for (const f of page.frames()) {
-        try {
-          if (await tryClickKochira(f)) { relayed = true; break; }
-        } catch {}
-      }
+    // A) まず HOME を試すが、失敗しても “ソフト失敗” 扱いで先へ進む
+    let homeReached = false;
+    try {
+      homeReached = await gotoWithFallback(page, HOME_URLS);
+    } catch {}
+    if (homeReached) {
+      await saveShot(page, "_home_");
+      await saveHtml(page, "_home_");
+      console.log("[home] URL:", page.url());
+    } else {
+      console.log("[soft] HOME には入れなかったので、frameset 直行に切り替えます");
     }
 
+    // B) HOME がダメでも frameset 直叩きで突破を試す（本命）
+    await directFramesetStart(page);
+
+    // C) “こちら”→forwardForm submit（popup）へ
+    let relayed = false;
+    if (await tryClickKochira(page)) relayed = true;
+    if (!relayed) {
+      for (const f of page.frames()) {
+        try { if (await tryClickKochira(f)) { relayed = true; break; } } catch {}
+      }
+    }
     await waitIdle(page, 700);
     await saveShot(page, "_after_relay_");
     await saveHtml(page, "_after_relay_");
 
-    // 4) 仕様通り popup を開いて forwardForm を submit
-    const submitted = await submitForwardFormWithPopup(page);
+    // D) popup 経由 submit（うまく行かなければ 1 回だけ作り直して再試行）
+    let submitted = await submitForwardFormWithPopup(page);
     if (!submitted) {
-      console.log("[relay] fallback: 再度 frameset 直叩き→submit を試行");
-      // もう一度 frameset を作り直して submit 試行
+      console.log("[relay] 失敗 → frameset 作り直して再試行");
       await directFramesetStart(page);
       await waitIdle(page, 500);
-      const submitted2 = await submitForwardFormWithPopup(page);
-      if (!submitted2) throw new Error("forwardForm submit (popup) failed");
+      submitted = await submitForwardFormWithPopup(page);
+    }
+    if (!submitted) {
+      console.log("[relay] popup submit できず（サーバ混雑かも）。状態を保存して終了します。");
+      await saveShot(page, "_after_submit_");
+      await saveHtml(page, "_after_submit_");
+      return; // ← ここで正常終了扱い
     }
 
-    // 5) submit 後の状態を保存
+    // E) submit 後の状態を保存
     await waitIdle(page, 800);
     await saveShot(page, "_after_submit_");
     await saveHtml(page, "_after_submit_");
 
-    // 6) 最後に見えている URL/TITLE をログ
     console.log("[final] URL:", page.url());
     console.log("[final] TITLE:", await page.title());
   } catch (e) {
