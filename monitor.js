@@ -148,6 +148,34 @@ async function _progressHappened(page, prevUrl, prevTitle) {
   } catch { return false; }
 }
 
+// 中継ページの「こちら」を全部のフレームで探して踏み抜く
+async function clickRelayLoop(page) {
+  for (let step = 0; step < 5; step++) {
+    let clicked = false;
+
+    // page 本体 + すべての frame を総当り
+    for (const ctx of [page, ...page.frames()]) {
+      const link = ctx.getByRole("link", { name: /こちら/ });
+      if (await link.count()) {
+        console.log(`[relay] click "こちら" on ${ctx === page ? "main" : ("frame:" + ctx.url())}`);
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded").catch(()=>{}),
+          link.first().click().catch(()=>{})
+        ]);
+        clicked = true;
+      }
+    }
+
+    // 1回でもクリックしたらちょい待ち→さらに「こちら」が出ていれば繰り返す
+    if (clicked) {
+      await page.waitForTimeout(800);
+    } else {
+      break; // もう「こちら」が無ければ終了
+    }
+  }
+}
+
+
 /* --- 検索押下（page と全frameを総当たり） --- */
 async function pressSearch(page) {
   const clickOn = async (ctx, label) => {
@@ -267,6 +295,8 @@ async function recoverApologyOnce(page, flag) {
 
     // 3) 調査ダンプ
     try { fs.writeFileSync("before-search.html", await page.content()); } catch {}
+　　
+    await clickRelayLoop(page);   // ← 追加（中継ページを突破）
 
     // 4) おわび1回リカバリ
     const once = { used: false };
