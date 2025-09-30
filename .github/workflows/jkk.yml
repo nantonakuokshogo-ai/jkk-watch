@@ -1,25 +1,36 @@
 name: JKK Watch (smoke test)
 
 on:
-  workflow_dispatch:    # 手動実行ボタン
-  schedule:
-    - cron: "*/5 * * * *"   # 5分おき（まずはゆるめでOK）
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 15   # ← 全体タイムアウトを15分に延長
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install
-      - run: node monitor.js
-      - name: Save screenshot (if any)
-        if: always()
+
+      - name: Install deps
+        run: |
+          npm ci || npm i
+          npx playwright install --with-deps chromium
+
+      - name: Run
+        run: node monitor.js
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: page-screenshot
-          path: out.png
-          if-no-files-found: ignore
+          name: jkk-artifacts
+          path: |
+            *.png
+            *.html
+            debug_*.txt
+          if-no-files-found: warn
