@@ -1,18 +1,7 @@
 import { chromium } from 'playwright';
 
 const START = 'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit';
-const KEYWORD = 'DK'; // ←まずは確実に出る語でテスト。OKなら本命に置き換え。
-
-async function notify(msg) {
-  const token = process.env.LINE_NOTIFY_TOKEN;
-  if (!token) { console.log('[NOTIFY]', msg); return; }
-  const res = await fetch('https://notify-api.line.me/api/notify', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ message: msg }).toString()
-  });
-  console.log('LINE status', res.status);
-}
+const KEYWORD = 'DK';
 
 async function gotoWithRetry(page, url, tries = 3) {
   for (let i = 1; i <= tries; i++) {
@@ -29,54 +18,92 @@ async function gotoWithRetry(page, url, tries = 3) {
   return false;
 }
 
-async function clickCandidates(ctx) {
-  // ★まず「検索」ボタンを最優先でクリック
-  const searchBtn = ctx.getByRole('button', { name: /検索/ });
-  if (await searchBtn.count()) {
-    try {
+// ★ 中継ページ突破：「こちら」を確実に押す（メイン＋全フレーム・ログ付き）
+async function passRelay(page) {
+  console.log('[relay] start');
+  const clickHereOn = async (ctx, label) => {
+    const link = ctx.getByRole('link', { name: /こちら/ });
+    if (await link.count()) {
+      console.log(`[relay] click "${label}" -> こちら`);
       await Promise.all([
-        ctx.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(()=>{}),
-        searchBtn.first().click({ timeout: 2000 })
+        ctx.waitForLoadState('domcontentloaded').catch(()=>{}),
+        link.first().click({ timeout: 3000 })
       ]);
-      console.log("検索ボタンをクリックしました");
-      return;
-    } catch (e) {
-      console.log("検索クリック失敗", e.message);
+      return true;
     }
+    return false;
+  };
+
+  // メイン
+  if (await clickHereOn(page, 'main')) { await page.waitForTimeout(1200); return; }
+  // フレーム
+  for (const f of page.frames()) {
+    if (await clickHereOn(f, `frame:${f.url()}`)) { await page.waitForTimeout(1200); return; }
   }
 
-  // それ以外の候補も試す
-  const roles = [
-    ['link',   /空き|次へ|同意|OK/i],
-    ['button', /空き|次へ|同意|OK/i],
-  ];
-  for (const [role, name] of roles) {
-    const loc = ctx.getByRole(role, { name });
-    if (await loc.count()) {
-      try {
-        await Promise.all([
-          ctx.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(()=>{}),
-          loc.first().click({ timeout: 2000 })
-        ]);
-        console.log("クリック:", role, name);
-        return;
-      } catch {}
-    }
-  }
+  // メタリフレッシュ（自動遷移）の待機も入れる
+  console.log('[relay] no anchor found, wait a bit');
+  await page.waitForTimeout(2000);
 }
 
+// 検索ボタン押下（メイン＋フレーム）
+async function pressSearch(page) {
+  const tryOn = async (ctx, desc) => {
+    // 最優先で「検索」ボタン
+    let btn = ctx.getByRole('button', { name: /^検索$/ });
+    if (await btn.count()) {
+      console.log(`[search] click (${desc}) "検索"`);
+      await Promise.all([
+        ctx.waitForLoadState('domcontentloaded').catch(()=>{}),
+        btn.first().click({ timeout: 3000 })
+      ]);
+      return true;
+    }
+    // 予備：リンクや似たラベル
+    const candidates = [
+      ctx.getByRole('link',   { name: /空き|検索/ }),
+      ctx.getByRole('button', { name: /空き|検索|次へ|同意|OK/ }),
+      ctx.getByText('検索', { exact: true }),
+    ];
+    for (const loc of candidates) {
+      if (await loc.count()) {
+        console.log(`[search] click (${desc}) fallback`);
+        try {
+          await Promise.all([
+            ctx.waitForLoadState('domcontentloaded').catch(()=>{}),
+            loc.first().click({ timeout: 3000 })
+          ]);
+          return true;
+        } catch {}
+      }
+    }
+    return false;
+  };
 
-async function setPageSize50(ctx) {
-  const selects = ctx.locator('select');
-  const count = await selects.count();
-  for (let i = 0; i < count; i++) {
-    try {
-      await selects.nth(i).selectOption({ label: '50' });
-      const apply = ctx.getByRole('button', { name: /表示|再表示|検索|反映/i });
-      if (await apply.count()) await apply.first().click().catch(()=>{});
-      return;
-    } catch {}
-  }
+  if (await tryOn(page, 'main')) return true;
+  for (const f of page.frames()) { if (await tryOn(f, `frame:${f.url()}`)) return true; }
+  return false;
+}
+
+// 一覧で「50件」を選択（あれば）
+async function setPageSize50(page) {
+  const tryOn = async (ctx, desc) => {
+    const selects = ctx.locator('select');
+    const count = await selects.count();
+    for (let i = 0; i < count; i++) {
+      try {
+        await selects.nth(i).selectOption({ label: '50' });
+        console.log(`[pagesize] set 50 on ${desc}`);
+        const apply = ctx.getByRole('button', { name: /表示|再表示|検索|反映/ });
+        if (await apply.count()) await apply.first().click().catch(()=>{});
+        return true;
+      } catch {}
+    }
+    return false;
+  };
+  if (await tryOn(page, 'main')) return true;
+  for (const f of page.frames()) { if (await tryOn(f, `frame:${f.url()}`)) return true; }
+  return false;
 }
 
 (async () => {
@@ -89,36 +116,33 @@ async function setPageSize50(ctx) {
     const ok = await gotoWithRetry(page, START);
     if (!ok) throw new Error('cannot open START');
 
-    // 入口→（同意/検索など）→次ページを数回試す（フレームも対象）
-    for (let step = 0; step < 3; step++) {
-      const ctxs = [page, ...page.frames()];
-      for (const ctx of ctxs) await clickCandidates(ctx);
+    // ★ 中継ページを越える
+    await passRelay(page);
+
+    // ★ 検索を押す（2回まで試す）
+    for (let i = 0; i < 2; i++) {
+      const done = await pressSearch(page);
       await page.waitForTimeout(1200);
+      if (done) break;
     }
 
-    // 一覧想定で「50件」を試す
-    {
-      const ctxs = [page, ...page.frames()];
-      for (const ctx of ctxs) await setPageSize50(ctx);
-      await page.waitForTimeout(1000);
-    }
+    // ★ 一覧ページ想定：50件に（任意）
+    await setPageSize50(page);
+    await page.waitForTimeout(1000);
 
-    // キーワード検出（全フレーム対象）
+    // 判定
     let hit = false;
     for (const ctx of [page, ...page.frames()]) {
       const html = await ctx.content();
       if (html.includes(KEYWORD)) { hit = true; break; }
     }
-
-    if (hit) await notify(`【JKK】"${KEYWORD}" を検出しました。`);
-    else console.log('not found');
+    console.log(hit ? 'HIT' : 'not found');
 
     console.log('URL:', page.url());
     try { console.log('TITLE:', await page.title()); } catch {}
     await page.screenshot({ path: 'out.png', fullPage: true });
   } catch (e) {
     console.error('ERROR', e);
-    await notify(`【JKK】監視エラー: ${e}`);
     try { await page.screenshot({ path: 'out.png', fullPage: true }); } catch {}
     process.exitCode = 1;
   } finally {
