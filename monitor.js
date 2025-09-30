@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import fs from "fs";
 
 /* ============ 設定 ============ */
 const HOME = "https://jhomes.to-kousya.or.jp/search/jkknet/";
@@ -171,42 +172,85 @@ async function enterFromHome(page) {
   return await gotoRetry(page, "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit");
 }
 
-/** 検索ボタンを押す */
+// 検索ボタンを押す（role/テキスト/submit/onclick/画像/最終手段:最初のform.submit）
 async function pressSearch(page) {
   const tryOn = async (ctx, label) => {
-    const main = ctx.getByRole("button", { name: /^検索$/ });
-    if (await main.count()) {
-      console.log(`[search] click (${label}) "検索"`);
-      await Promise.all([
-        ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-        main.first().click({ timeout: 4000 })
-      ]);
-      return true;
-    }
-    const fallbacks = [
-      ctx.getByRole("button", { name: /検索|空き|空家|次へ|同意|OK/ }),
-      ctx.getByRole("link",   { name: /検索|空き|空家/ }),
-      ctx.getByText("検索", { exact: true })
+    // 1) まずは素直に role=button で
+    const names = [
+      /^検索$/, /検索する/, /空き|空家.*検索/, /空室.*検索/, /条件.*検索/,
+      /次へ/, /同意して(検索|進む)/, /OK/
     ];
-    for (const loc of fallbacks) {
-      if (await loc.count()) {
-        console.log(`[search] click fallback (${label})`);
-        try {
-          await Promise.all([
-            ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-            loc.first().click({ timeout: 4000 })
-          ]);
-          return true;
-        } catch {}
+    for (const n of names) {
+      const btn = ctx.getByRole("button", { name: n });
+      if (await btn.count()) {
+        console.log(`[search] role button match on ${label}: ${n}`);
+        await Promise.all([
+          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+          btn.first().click({ timeout: 4000 })
+        ]);
+        return true;
       }
     }
+
+    // 2) input/button要素（value/alt/innerText）
+    const cssCandidates = [
+      'input[type="submit"]', 'input[type="image"]', 'button', 'a'
+    ];
+    for (const sel of cssCandidates) {
+      const el = ctx.locator(sel);
+      const cnt = await el.count();
+      for (let i = 0; i < Math.min(cnt, 20); i++) {
+        const h = el.nth(i);
+        const txt = (await h.innerText().catch(()=>'')) || '';
+        const val = (await h.getAttribute('value').catch(()=>'')) || '';
+        const alt = (await h.getAttribute('alt').catch(()=>'')) || '';
+        const onclick = (await h.getAttribute('onclick').catch(()=>'')) || '';
+        const href = (await h.getAttribute('href').catch(()=>'')) || '';
+        const s = `${txt}${val}${alt}${onclick}${href}`;
+        if (/検索|空き|空家|空室|次へ|同意/i.test(s)) {
+          console.log(`[search] css "${sel}" on ${label} -> click`);
+          try {
+            await Promise.all([
+              ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+              h.click({ timeout: 4000, force: true })
+            ]);
+            return true;
+          } catch {}
+        }
+        // javascript:submit 系リンク
+        if (/submit\(/i.test(onclick) || /^javascript:.*submit/i.test(href || '')) {
+          console.log(`[search] submit-like link on ${label} -> click`);
+          try {
+            await Promise.all([
+              ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+              h.click({ timeout: 4000, force: true })
+            ]);
+            return true;
+          } catch {}
+        }
+      }
+    }
+
+    // 3) 最終手段: 最初の form を submit()
+    const submitted = await ctx.evaluate(() => {
+      const f = document.querySelector('form');
+      if (f) { f.submit(); return true; }
+      return false;
+    }).catch(()=>false);
+    if (submitted) {
+      console.log(`[search] force form.submit() on ${label}`);
+      await ctx.waitForLoadState("domcontentloaded").catch(()=>{});
+      return true;
+    }
+
     return false;
   };
 
-  if (await tryOn(page, "main")) return true;
-  for (const f of page.frames()) if (await tryOn(f, `frame:${await f.url()}`)) return true;
+  if (await tryOn(page, 'main')) return true;
+  for (const f of page.frames()) { if (await tryOn(f, `frame:${await f.url()}`)) return true; }
   return false;
 }
+
 
 /** 一覧で「50件」を選ぶ（あれば） */
 async function setPageSize50(page) {
@@ -261,15 +305,19 @@ async function recoverApologyOnce(page, flag) {
     const once = { used: false };
     await recoverApologyOnce(page, once);
 
-    // 4) 検索ボタン（最大2回試す）
-    for (let i = 0; i < 2; i++) {
-      const ok = await pressSearch(page);
-      await page.waitForTimeout(1000);
-      await recoverApologyOnce(page, once);
-      if (ok) break;
-    }
-    await dumpWhere(page, "after-search");
-    await screenshot(page, "step3-after-search.png");
+ // 検索前に HTML を落とす（調査用）
+try { fs.writeFileSync('before-search.html', await page.content()); } catch {}
+
+// ④ 検索ボタン（最大2回試す）
+for (let i = 0; i < 2; i++) {
+  const ok = await pressSearch(page);
+  await page.waitForTimeout(1000);
+  await recoverApologyOnce(page, once);
+  if (ok) break;
+}
+
+// 検索後に HTML を落とす（調査用）
+try { fs.writeFileSync('after-search.html', await page.content()); } catch {}
 
     // 5) 可能なら 50件表示へ
     await setPageSize50(page);
