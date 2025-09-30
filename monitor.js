@@ -18,21 +18,71 @@ async function gotoWithRetry(page, url, tries = 3) {
   return false;
 }
 
-// ★ 中継ページ突破：「こちら」を確実に押す（メイン＋全フレーム・ログ付き）
+// 置き換え：中継ページを確実に突破
 async function passRelay(page) {
   console.log('[relay] start');
-  const clickHereOn = async (ctx, label) => {
-    const link = ctx.getByRole('link', { name: /こちら/ });
-    if (await link.count()) {
-      console.log(`[relay] click "${label}" -> こちら`);
-      await Promise.all([
-        ctx.waitForLoadState('domcontentloaded').catch(()=>{}),
-        link.first().click({ timeout: 3000 })
-      ]);
+
+  // 1) まず anchor の href を直接取得して遷移
+  const readHref = async (ctx, label) => {
+    // ariaロール優先
+    let href = await ctx.getByRole('link', { name: /こちら/ }).first().getAttribute('href').catch(()=>null);
+    if (!href) {
+      // プレーンaタグでも検索
+      href = await ctx.locator('a', { hasText: 'こちら' }).first().getAttribute('href').catch(()=>null);
+    }
+    if (href && href !== '#') {
+      console.log(`[relay] goto from ${label}: ${href}`);
+      // 相対なら絶対URL化
+      if (!/^https?:\/\//i.test(href)) {
+        const base = new URL(ctx.url ? await ctx.url() : page.url());
+        href = href.startsWith('/') ? `${base.origin}${href}` : `${base.origin}${base.pathname.replace(/\/[^/]*$/, '/')}${href}`;
+      }
+      await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(()=>{});
       return true;
     }
     return false;
   };
+
+  // 2) meta refresh の URL を拾って遷移
+  const readMetaRefresh = async (ctx, label) => {
+    const html = await ctx.content().catch(()=> '');
+    const m = html && html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)/i);
+    if (m && m[1]) {
+      let url = m[1];
+      console.log(`[relay] meta refresh from ${label}: ${url}`);
+      if (!/^https?:\/\//i.test(url)) {
+        const base = new URL(ctx.url ? await ctx.url() : page.url());
+        url = url.startsWith('/') ? `${base.origin}${url}` : `${base.origin}${base.pathname.replace(/\/[^/]*$/, '/')}${url}`;
+      }
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(()=>{});
+      return true;
+    }
+    return false;
+  };
+
+  // 3) メイン→全フレームの順で試す
+  if (await readHref(page, 'main')) { console.log('[relay] href (main) OK'); return; }
+  for (const f of page.frames()) { if (await readHref(f, `frame:${f.url()}`)) { console.log('[relay] href (frame) OK'); return; } }
+
+  if (await readMetaRefresh(page, 'main')) { console.log('[relay] meta (main) OK'); return; }
+  for (const f of page.frames()) { if (await readMetaRefresh(f, `frame:${f.url()}`)) { console.log('[relay] meta (frame) OK'); return; } }
+
+  // 4) 最後にクリックも一応試す（保険）
+  const link = page.getByRole('link', { name: /こちら/ });
+  if (await link.count()) {
+    console.log('[relay] fallback click');
+    await Promise.all([
+      page.waitForLoadState('domcontentloaded').catch(()=>{}),
+      link.first().click({ timeout: 3000 })
+    ]);
+  }
+  await page.waitForTimeout(1500);
+
+  // 5) デバッグ：現在のURLと全フレームURLを出す
+  console.log('[relay] after, URL:', page.url());
+  for (const f of page.frames()) console.log('[relay] frame:', f.url());
+}
+
 
   // メイン
   if (await clickHereOn(page, 'main')) { await page.waitForTimeout(1200); return; }
