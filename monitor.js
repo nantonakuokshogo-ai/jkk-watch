@@ -18,6 +18,20 @@ const OUT = (name, ext) => `${name}.${ext}`;
 
 // ---------- 小物ユーティリティ ----------
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// 謝罪/タイムアウト表示から「こちら」を踏んで抜ける
+async function hopFromApology(page) {
+  if (!(await isApologyOrTimeout(page))) return false;
+  const sel = 'a:has-text("こちら")';
+  const a = await page.$(sel);
+  if (a) {
+    await a.click({ timeout: 3000 }).catch(() => {});
+    await page.waitForLoadState("load", { timeout: 8000 }).catch(() => {});
+    return true;
+  }
+  // 数秒待つと自動遷移するタイプもある
+  await page.waitForTimeout(2500);
+  return await isApologyOrTimeout(page) ? false : true;
+}
 
 async function saveScreenshot(page, name) {
   try { await page.screenshot({ path: OUT(name, "png"), fullPage: true }); }
@@ -118,62 +132,78 @@ async function forceSubmitForms(page) {
 
 // ---------- HOME 導出（どこに居ても START へ向かうための復帰動線） ----------
 async function reachHomeSequence(page) {
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < 2; round++) {
     for (const u of HOME_CANDIDATES) {
       log("goto", u);
-      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
-      await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
+      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+      await page.waitForLoadState("load", { timeout: 10000 }).catch(() => {});
 
       if (await isApologyOrTimeout(page)) {
-        log("recover", "apology -> back to top");
+        // まずは「こちら」での脱出を試す
+        if (await hopFromApology(page)) {
+          const t = (await titleOf(page)) || "";
+          if (!t.includes("おわび")) return true;
+        }
+        // それでもダメならトップに戻るボタン
         await clickBackToTop(page);
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(1200);
       }
 
-      // ある程度正常画面なら OK とみなす
       const t = (await titleOf(page)) || "";
       if (!t.includes("おわび")) return true;
     }
-    await sleep(800);
   }
+  // ★ HOMEに到達できなくても、以降の処理（StartInit直行）に進ませる
   return false;
 }
+
 
 // ---------- MAIN ----------
 (async () => {
   const browser = await chromium.launch({ headless: true }); // Actions なら true でOK
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    viewport: { width: 1280, height: 900 },
-  });
+const context = await browser.newContext({
+  userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+  viewport: { width: 1280, height: 900 },
+  locale: "ja-JP",
+  timezoneId: "Asia/Tokyo",
+  extraHTTPHeaders: {
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": BASE,
+    "Referer": `${BASE}/search/jkknet/service/`,
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+  },
+});
+
   const page = await context.newPage();
 
   const stamp = now();
 
   try {
     // 1) HOME 相当までたどり着けるか
-    const ok = await reachHomeSequence(page);
-    if (!ok) {
-      log("ERROR", "cannot reach HOME sequence");
-      await saveScreenshot(page, `_home_${stamp}`);
-      await saveHTML(page, `_home_${stamp}`);
-      process.exit(1);
-    }
+const ok = await reachHomeSequence(page);
+if (!ok) {
+  log("warn", "HOME unreachable — proceed to StartInit directly with referer");
+  await saveScreenshot(page, `_home_${stamp}`);
+  await saveHTML(page, `_home_${stamp}`);
+}
+
 
     // 2) frameset 経由 or 直接 StartInit へ
     //    直接行って、もしおわび表示なら「トップへ戻る」→再度トライ
-    log("goto", START);
-    await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
-    await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
+log("goto", START);
+await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+await page.waitForLoadState("load", { timeout: 10000 }).catch(() => {});
 
-    if (await isApologyOrTimeout(page)) {
-      log("recover", "apology/timeout at StartInit -> back to top then try StartInit again");
-      await clickBackToTop(page);
-      await page.waitForTimeout(1000);
-      await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
-      await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
-    }
+if (await isApologyOrTimeout(page)) {
+  log("recover", "apology at StartInit -> hop 'こちら' then retry StartInit");
+  await hopFromApology(page);
+  await page.waitForTimeout(800);
+  await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+  await page.waitForLoadState("load", { timeout: 10000 }).catch(() => {});
+}
+
 
     await saveScreenshot(page, `_frameset_${stamp}`);
     await saveHTML(page, `_frameset_${stamp}`);
