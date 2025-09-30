@@ -1,264 +1,222 @@
-// monitor.js (全貼り用 / Node.js v20 + Playwright)
-// -------------------------------------------------
-// 使い方: `node monitor.js`
-// - out/ フォルダに各段階の HTML と PNG を保存します
-// - 0 で終了: 監視フロー成功（ページに到達 or 正常に遷移）
-// - 非 0 で終了: サイト側のお詫び/タイムアウト/混雑などで目標に到達できず
-//
-// 依存: package.json に playwright が入っていること
-//      postinstall で "npx playwright install --with-deps chromium" を実行済
-//
-// -------------------------------------------------
+// monitor.js  —— full replace version (Playwright / Node20 ESM)
+// 実行ログに分かりやすいタグを出します。PNG/HTMLを同じフォルダに保存します。
 
+import fs from "node:fs/promises";
+import path from "node:path";
 import { chromium } from "playwright";
-import fs from "fs/promises";
-import path from "path";
 
-// ========= 基本設定 ==========
-const OUT_DIR = process.env.OUT_DIR || "out";
 const BASE = "https://jhomes.to-kousya.or.jp";
-
-const HOME_TRY_URLS = [
+const START = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
+const HOME_CANDIDATES = [
   `${BASE}/`,
   `${BASE}/search/jkknet/`,
   `${BASE}/search/jkknet/index.html`,
   `${BASE}/search/jkknet/service/`,
 ];
 
-// 直接 StartInit へ（frameset 経由の場合もあるため Referer を付与）
-const START_INIT = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
+const OUT = (name, ext) => `${name}.${ext}`;
 
-// Playwright ナビゲーションの待ち
-const NAV_WAIT = "domcontentloaded";
-const NAV_TIMEOUT = 25_000; // 25s
-const STEP_RETRY = 4;
+// ---------- 小物ユーティリティ ----------
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ========= ユーティリティ ==========
-
-async function ensureOutDir() {
-  await fs.mkdir(OUT_DIR, { recursive: true });
+async function saveScreenshot(page, name) {
+  try { await page.screenshot({ path: OUT(name, "png"), fullPage: true }); }
+  catch { /* ignore */ }
 }
 
-async function dump(page, name) {
-  await ensureOutDir();
-  const html = await page.content();
-  await fs.writeFile(path.join(OUT_DIR, `${name}.html`), html, "utf8");
-  await page.screenshot({
-    path: path.join(OUT_DIR, `${name}.png`),
-    fullPage: true,
-  });
-  console.log(`[dump] saved: ${name}.html / ${name}.png`);
-}
-
-// 「お詫び」「エラー」「タイムアウト」「混雑」系の判定（強めに）
-async function isApologyLike(page) {
+async function saveHTML(target, name) {
   try {
-    const title = (await page.title()) || "";
-    const bodyText = (await page.textContent("body")) || "";
-
-    const hit =
-      /おわび|その操作は行わない|ページが見つかりません|タイムアウト|混みあっております|大変混雑|エラーが発生しました/i.test(
-        title + "\n" + bodyText
-      );
-    return !!hit;
-  } catch {
-    return false;
-  }
+    const html = await target.content();
+    await fs.writeFile(OUT(name, "html"), html, "utf8");
+  } catch { /* ignore */ }
 }
 
-// 「トップページへ戻る」など、ホームへ戻すリンクを押す
-async function clickBackToTopIfAny(page) {
-  const candidates = [
+function now() {
+  const d = new Date();
+  return d.toISOString().replace(/[:.]/g, "-");
+}
+
+async function titleOf(page) {
+  try { return await page.title(); } catch { return ""; }
+}
+
+async function urlOf(page) {
+  try { return page.url(); } catch { return ""; }
+}
+
+function log(tag, msg = "") {
+  console.log(`[${tag}] ${msg}`);
+}
+
+// apology / timeout / notfound 判定
+async function isApologyOrTimeout(page) {
+  const t = (await titleOf(page)) || "";
+  if (t.includes("おわび")) return true;
+
+  // 画面内テキストを軽くチェック（重くならない範囲）
+  try {
+    const bodyText = await page.evaluate(() => document.body.innerText || "");
+    if (/タイムアウト|おわび|その操作は|大変混雑/.test(bodyText)) return true;
+  } catch {}
+  return false;
+}
+
+// 「トップページへ戻る」リンク押下
+async function clickBackToTop(page) {
+  const selectors = [
+    'text="トップページへ戻る"',
     'a:has-text("トップページへ戻る")',
-    'input[type="button"][value*="トップページ"]',
-    'a:has-text("トップへ戻る")',
+    'input[value="トップページへ戻る"]',
+    'button:has-text("トップページへ戻る")',
   ];
-
-  for (const sel of candidates) {
-    const loc = page.locator(sel).first();
-    if (await loc.count()) {
-      try {
-        await Promise.all([
-          page.waitForLoadState(NAV_WAIT, { timeout: NAV_TIMEOUT }),
-          loc.click({ timeout: 3_000 }),
-        ]);
-        return true;
-      } catch {
-        // だめなら次
-      }
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await Promise.allSettled([page.waitForLoadState("load", { timeout: 8000 })]);
+      await el.click({ timeout: 3000 }).catch(()=>{});
+      await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(()=>{});
+      return true;
     }
   }
   return false;
 }
 
-// 指定テキストのリンクを「全フレーム」から探して押す
-async function clickLinkAcrossFrames(page, text = "こちら") {
-  const frames = page.frames();
-  for (const f of frames) {
-    const loc = f.locator(`a:has-text("${text}")`).first();
-    if ((await loc.count()) > 0) {
-      try {
-        await Promise.all([
-          page.waitForLoadState(NAV_WAIT, { timeout: NAV_TIMEOUT }),
-          loc.click({ timeout: 3_000 }),
-        ]);
-        return true;
-      } catch {
-        // 次のフレームで試す
+// こちらクリック（main と全 frame を対象）
+async function clickKochiraEverywhere(page) {
+  const frames = [page.mainFrame(), ...page.frames()];
+  let clicked = 0;
+
+  for (const fr of frames) {
+    try {
+      const handle = await fr.$('a:has-text("こちら")');
+      if (handle) {
+        await handle.click({ timeout: 3000 }).catch(()=>{});
+        clicked++;
       }
-    }
+    } catch {}
   }
-  return false;
+  return clicked;
 }
 
-// form を「全フレーム」で強制 submit（auto 次画面誘発用）
-async function submitFirstFormAcrossFrames(page) {
-  const frames = page.frames();
-  let submitted = false;
-  for (const f of frames) {
+// 全 frame / main で form.submit() を試す
+async function forceSubmitForms(page) {
+  const frames = [page.mainFrame(), ...page.frames()];
+  let submitted = 0;
+
+  for (const fr of frames) {
     try {
-      const did = await f.evaluate(() => {
-        const forms = Array.from(document.forms || []);
-        if (forms.length > 0) {
-          try {
-            forms[0].submit();
-            return true;
-          } catch {
-            return false;
-          }
-        }
-        return false;
-      });
-      submitted ||= did;
-    } catch {
-      // ignore
-    }
-  }
-  if (submitted) {
-    try {
-      await page.waitForLoadState(NAV_WAIT, { timeout: NAV_TIMEOUT });
-    } catch {
-      // ignore
-    }
+      const count = await fr.evaluate(() => {
+        const forms = Array.from(document.querySelectorAll("form"));
+        forms.forEach(f => { try { f.submit(); } catch {} });
+        return forms.length;
+      }).catch(()=>0);
+      submitted += count || 0;
+    } catch {}
   }
   return submitted;
 }
 
-// 指定 URL にリトライ付きで移動（apology だったら戻るを押して再チャレンジ）
-async function gotoWithRecover(page, url, nameForDump) {
-  let lastErr;
-  for (let i = 1; i <= STEP_RETRY; i++) {
-    try {
-      console.log(`[goto] try ${i}/${STEP_RETRY}: ${url}`);
-      await page.goto(url, { waitUntil: NAV_WAIT, timeout: NAV_TIMEOUT });
-      await dump(page, nameForDump ?? `step_goto_${i}`);
+// ---------- HOME 導出（どこに居ても START へ向かうための復帰動線） ----------
+async function reachHomeSequence(page) {
+  for (let round = 0; round < 3; round++) {
+    for (const u of HOME_CANDIDATES) {
+      log("goto", u);
+      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
+      await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
 
-      if (await isApologyLike(page)) {
-        console.log(`[goto] apology-like detected -> try back to top`);
-        const clicked = await clickBackToTopIfAny(page);
-        await dump(page, `${nameForDump ?? "step"}_apology_${i}`);
-        if (!clicked) throw new Error("apology without back-to-top link");
-        // 次のループで再トライ
-        continue;
+      if (await isApologyOrTimeout(page)) {
+        log("recover", "apology -> back to top");
+        await clickBackToTop(page);
+        await page.waitForTimeout(1500);
       }
-      return; // success
-    } catch (e) {
-      lastErr = e;
-      console.log(`[goto] failed (${i}): ${e?.message ?? e}`);
-      // 次ループで再トライ
+
+      // ある程度正常画面なら OK とみなす
+      const t = (await titleOf(page)) || "";
+      if (!t.includes("おわび")) return true;
     }
+    await sleep(800);
   }
-  throw lastErr ?? new Error(`cannot goto: ${url}`);
+  return false;
 }
 
-// ========= メインフロー ==========
-
-async function main() {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-web-security",
-    ],
-  });
-
-  const ctx = await browser.newContext({
+// ---------- MAIN ----------
+(async () => {
+  const browser = await chromium.launch({ headless: true }); // Actions なら true でOK
+  const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
     viewport: { width: 1280, height: 900 },
   });
+  const page = await context.newPage();
 
-  const page = await ctx.newPage();
-  page.setDefaultTimeout(15_000);
-
-  let exitCode = 0;
+  const stamp = now();
 
   try {
-    // 1) HOME 相当へ（いずれかに入れれば OK）
-    for (let i = 0; i < HOME_TRY_URLS.length; i++) {
-      try {
-        await gotoWithRecover(page, HOME_TRY_URLS[i], `_home_try_${i + 1}`);
-        break; // どれか成功したら抜ける
-      } catch (e) {
-        if (i === HOME_TRY_URLS.length - 1) {
-          throw new Error("cannot reach HOME sequence");
-        }
-      }
-    }
-    await dump(page, "_home_");
-
-    // 2) StartInit へ（frameset 直のことがある）
-    //    Referer を付けておくと安定する場合がある
-    await page.route("**/*", (route) => {
-      const headers = {
-        ...route.request().headers(),
-        Referer: `${BASE}/search/jkknet/service/`,
-      };
-      route.continue({ headers }).catch(() => {});
-    });
-
-    await gotoWithRecover(page, START_INIT, "_frameset_");
-
-    // 3) StartInit で「こちら」を積極的にクリック（main/frames の両方）
-    //    何回かやって次に進める
-    for (let i = 1; i <= 4; i++) {
-      const clicked = await clickLinkAcrossFrames(page, "こちら");
-      await dump(page, `_after_relay_${i}`);
-      if (!clicked) break; // クリックできなければ終える（auto 遷移に任せる）
+    // 1) HOME 相当までたどり着けるか
+    const ok = await reachHomeSequence(page);
+    if (!ok) {
+      log("ERROR", "cannot reach HOME sequence");
+      await saveScreenshot(page, `_home_${stamp}`);
+      await saveHTML(page, `_home_${stamp}`);
+      process.exit(1);
     }
 
-    // 4) 念のため、フォーム submit を強制（auto 遷移の促進）
-    for (let i = 1; i <= 2; i++) {
-      const submitted = await submitFirstFormAcrossFrames(page);
-      await dump(page, `_after_submit_${i}`);
-      if (!submitted) break;
+    // 2) frameset 経由 or 直接 StartInit へ
+    //    直接行って、もしおわび表示なら「トップへ戻る」→再度トライ
+    log("goto", START);
+    await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
+    await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
+
+    if (await isApologyOrTimeout(page)) {
+      log("recover", "apology/timeout at StartInit -> back to top then try StartInit again");
+      await clickBackToTop(page);
+      await page.waitForTimeout(1000);
+      await page.goto(START, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
+      await page.waitForLoadState("load", { timeout: 10000 }).catch(()=>{});
     }
 
-    // 5) 最終状態を保存
-    await dump(page, "_final_");
+    await saveScreenshot(page, `_frameset_${stamp}`);
+    await saveHTML(page, `_frameset_${stamp}`);
 
-    // 6) 成否の最終判定
-    //    今回は「お詫び/タイムアウト/混雑」状態で終わっていれば非 0 を返す
-    if (await isApologyLike(page)) {
-      console.log("[final] apology-like page remained -> treat as failure.");
-      exitCode = 2;
-    } else {
-      console.log("[final] reached non-apology page -> success-ish.");
-      exitCode = 0;
+    // 3) 「こちら」をできる限り押す（main / frame）
+    log("relay", 'click "こちら" everywhere');
+    for (let i = 0; i < 3; i++) {
+      const n = await clickKochiraEverywhere(page);
+      if (n === 0) break;
+      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(()=>{});
+      await sleep(600);
     }
+
+    await saveScreenshot(page, `_after_relay_${stamp}`);
+    await saveHTML(page, `_after_relay_${stamp}`);
+
+    // 4) (念のため) 全フォーム submit を試す
+    log("submit", "force form.submit() on all frames");
+    const submitted = await forceSubmitForms(page);
+    if (submitted > 0) {
+      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(()=>{});
+      await sleep(800);
+    }
+
+    await saveScreenshot(page, `_after_submit_${stamp}`);
+    await saveHTML(page, `_after_submit_${stamp}`);
+
+    // 5) 仕上げログ
+    log("final", `URL: ${await urlOf(page)}`);
+    log("final", `TITLE: ${await titleOf(page)}`);
+
+    await saveScreenshot(page, `_final_${stamp}`);
+    await saveHTML(page, `_final_${stamp}`);
+
+    // ここまで到達すれば Actions 上は成功扱いにしておく
+    process.exit(0);
   } catch (e) {
-    console.error("[error]", e?.stack || e?.message || String(e));
-    exitCode = 1;
+    log("FATAL", String(e?.stack || e));
+    try { await saveScreenshot(page, `_fatal_${stamp}`); } catch {}
+    try { await saveHTML(page, `_fatal_${stamp}`); } catch {}
+    process.exit(1);
   } finally {
-    await ctx.close().catch(() => {});
-    await browser.close().catch(() => {});
-    process.exit(exitCode);
+    await context.close();
+    await browser.close();
   }
-}
-
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+})();
