@@ -1,12 +1,12 @@
 {
   "name": "jkk-watch",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node monitor.js",
-    "postinstall": "npx playwright install --with-deps chromium"
+    "start": "node monitor.js"
   },
   "dependencies": {
-    "playwright": "^1.47.0"
+    "puppeteer": "^22.15.0"
   }
 }
