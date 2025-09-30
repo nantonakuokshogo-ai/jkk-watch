@@ -172,84 +172,86 @@ async function enterFromHome(page) {
   return await gotoRetry(page, "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit");
 }
 
-// 検索ボタンを押す（role/テキスト/submit/onclick/画像/最終手段:最初のform.submit）
+// URLが変わった/タイトルが変わった/ネットワークが静かになったら「進んだ」とみなす
+async function _progressHappened(page, prevUrl, prevTitle) {
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(()=>{});
+    const nowUrl = page.url();
+    const nowTitle = await page.title().catch(()=> "");
+    return (nowUrl !== prevUrl) || (nowTitle !== prevTitle);
+  } catch { return false; }
+}
+
+// 検索ボタンを「なんでも」押す：role→テキスト→属性→onclick→画像→Enter→全form.submit()
 async function pressSearch(page) {
-  const tryOn = async (ctx, label) => {
-    // 1) まずは素直に role=button で
-    const names = [
-      /^検索$/, /検索する/, /空き|空家.*検索/, /空室.*検索/, /条件.*検索/,
-      /次へ/, /同意して(検索|進む)/, /OK/
+  const clickCandidates = async (ctx, label) => {
+    const prevUrl = page.url();
+    const prevTitle = await page.title().catch(()=> "");
+
+    // 1) role=button 系（名前いろいろ）
+    const namePats = [
+      /^検索$/, /検索する/, /空き|空家|空室.*検索/, /条件.*検索/,
+      /同意して(検索|進む)/, /次へ/, /^OK$/
     ];
-    for (const n of names) {
-      const btn = ctx.getByRole("button", { name: n });
-      if (await btn.count()) {
-        console.log(`[search] role button match on ${label}: ${n}`);
+    for (const pat of namePats) {
+      const b = ctx.getByRole("button", { name: pat });
+      if (await b.count()) {
+        console.log(`[search] role button ${pat} on ${label}`);
         await Promise.all([
           ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-          btn.first().click({ timeout: 4000 })
-        ]);
-        return true;
+          b.first().click({ timeout: 4000 })
+        ]).catch(()=>{});
+        if (await _progressHappened(page, prevUrl, prevTitle)) return true;
       }
     }
 
-    // 2) input/button要素（value/alt/innerText）
-    const cssCandidates = [
-      'input[type="submit"]', 'input[type="image"]', 'button', 'a'
-    ];
-    for (const sel of cssCandidates) {
-      const el = ctx.locator(sel);
-      const cnt = await el.count();
-      for (let i = 0; i < Math.min(cnt, 20); i++) {
-        const h = el.nth(i);
+    // 2) CSSセレクタで submit っぽい要素を総当たり
+    const sels = ['input[type="submit"]','input[type="image"]','button','a','img'];
+    for (const sel of sels) {
+      const els = ctx.locator(sel);
+      const n = await els.count();
+      for (let i = 0; i < Math.min(n, 40); i++) {
+        const h = els.nth(i);
         const txt = (await h.innerText().catch(()=>'')) || '';
         const val = (await h.getAttribute('value').catch(()=>'')) || '';
         const alt = (await h.getAttribute('alt').catch(()=>'')) || '';
+        const title = (await h.getAttribute('title').catch(()=>'')) || '';
         const onclick = (await h.getAttribute('onclick').catch(()=>'')) || '';
+        const aria = (await h.getAttribute('aria-label').catch(()=>'')) || '';
         const href = (await h.getAttribute('href').catch(()=>'')) || '';
-        const s = `${txt}${val}${alt}${onclick}${href}`;
-        if (/検索|空き|空家|空室|次へ|同意/i.test(s)) {
-          console.log(`[search] css "${sel}" on ${label} -> click`);
-          try {
-            await Promise.all([
-              ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-              h.click({ timeout: 4000, force: true })
-            ]);
-            return true;
-          } catch {}
-        }
-        // javascript:submit 系リンク
-        if (/submit\(/i.test(onclick) || /^javascript:.*submit/i.test(href || '')) {
-          console.log(`[search] submit-like link on ${label} -> click`);
-          try {
-            await Promise.all([
-              ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-              h.click({ timeout: 4000, force: true })
-            ]);
-            return true;
-          } catch {}
+        const s = `${txt} ${val} ${alt} ${title} ${aria} ${onclick} ${href}`;
+
+        if (/検索|空き|空家|空室|次へ|同意/i.test(s) || /submit\(/i.test(onclick) || /^javascript:.*submit/i.test(href)) {
+          console.log(`[search] click ${sel}[${i}] on ${label} -> "${s.trim().slice(0,40)}"`);
+          await h.click({ timeout: 4000, force: true }).catch(()=>{});
+          if (await _progressHappened(page, prevUrl, prevTitle)) return true;
+          // clickで動かない場合、Enter送出
+          try { await h.focus(); await page.keyboard.press("Enter"); } catch {}
+          if (await _progressHappened(page, prevUrl, prevTitle)) return true;
         }
       }
     }
 
-    // 3) 最終手段: 最初の form を submit()
+    // 3) JS から form.submit() を全部叩く（onclickでセットする値が必要な場合は効かないが最後の保険）
     const submitted = await ctx.evaluate(() => {
-      const f = document.querySelector('form');
-      if (f) { f.submit(); return true; }
-      return false;
-    }).catch(()=>false);
+      const forms = Array.from(document.forms || []);
+      forms.forEach(f => { try { f.submit(); } catch(_){} });
+      return forms.length;
+    }).catch(()=>0);
     if (submitted) {
-      console.log(`[search] force form.submit() on ${label}`);
-      await ctx.waitForLoadState("domcontentloaded").catch(()=>{});
-      return true;
+      console.log(`[search] force submit() ${submitted} forms on ${label}`);
+      await page.waitForTimeout(1500);
+      if (await _progressHappened(page, prevUrl, prevTitle)) return true;
     }
 
     return false;
   };
 
-  if (await tryOn(page, 'main')) return true;
-  for (const f of page.frames()) { if (await tryOn(f, `frame:${await f.url()}`)) return true; }
+  if (await clickCandidates(page, 'main')) return true;
+  for (const f of page.frames()) { if (await clickCandidates(f, `frame:${await f.url()}`)) return true; }
   return false;
 }
+
 
 
 /** 一覧で「50件」を選ぶ（あれば） */
