@@ -77,33 +77,99 @@ async function enterFromHome(page) {
   return true;
 }
 
-/* --- フレームセット /service/ をトップに開いて main フレームを取得 --- */
+// フレームセット /service/ を開き、main フレームに StartInit を必ず読ませる
 async function gotoFrameset(page) {
-  await gotoRetry(page, FRAMESET);
-  await page.waitForLoadState("domcontentloaded").catch(()=>{});
+  const FRAMESET = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
+  const START    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
 
-  // “こちら” 中継が main に出ることがあるので踏む
-  for (let t = 0; t < 3; t++) {
-    for (const f of page.frames()) {
-      const here = f.getByRole("link", { name: /こちら/ });
-      if (await here.count()) {
-        console.log("[frameset] click こちら in frame");
-        await Promise.all([
-          f.waitForLoadState("domcontentloaded").catch(()=>{}),
-          here.first().click().catch(()=>{})
-        ]);
+  // Apology/NotFound 画面で「トップページへ戻る」を押すヘルパ
+  const clickBackEverywhere = async () => {
+    const tryOn = async (ctx) => {
+      const link = ctx.getByRole("link", { name: /トップページへ戻る/ });
+      if (await link.count()) { await link.first().click().catch(()=>{}); return true; }
+      const btn  = ctx.getByRole("button", { name: /トップページへ戻る/ });
+      if (await btn.count())  { await btn.first().click().catch(()=>{});  return true; }
+      return false;
+    };
+    let done = await tryOn(page);
+    if (!done) {
+      for (const f of page.frames()) {
+        if (await tryOn(f)) { done = true; break; }
       }
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(800);
+    return done;
+  };
+
+  // “こちら” を踏むヘルパ
+  const clickHereEverywhere = async () => {
+    for (const ctx of [page, ...page.frames()]) {
+      const a = ctx.getByRole("link", { name: /こちら/ });
+      if (await a.count()) {
+        await Promise.all([
+          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+          a.first().click().catch(()=>{})
+        ]);
+        await page.waitForTimeout(600);
+      }
+    }
+  };
+
+  // main フレームを推定
+  const findMain = () => {
+    // 1) URLにStartInitを含む
+    let f = page.frames().find(fr => /akiyaJyoukenStartInit/i.test(fr.url()));
+    if (f) return f;
+    // 2) name="main" / id="main" っぽい
+    f = page.frames().find(fr => /(^|\/)main(\.html)?$/i.test(fr.url()) || /main/i.test(fr.name()));
+    if (f) return f;
+    // 3) 一番面積が大きそうなフレーム（fallback）
+    const all = page.frames().filter(fr => fr !== page.mainFrame());
+    return all[0] || null;
+  };
+
+  // 最大リトライ
+  for (let t = 1; t <= 5; t++) {
+    console.log(`[frameset] try ${t}`);
+    // /service/ を開く
+    await gotoRetry(page, FRAMESET);
+    await page.waitForLoadState("domcontentloaded").catch(()=>{});
+
+    // タイムアウト/おわびなら戻る→再試行
+    const title = (await page.title().catch(()=> "")) || "";
+    if (title.includes("おわび") || title.includes("見つかりません") || page.url().endsWith("/service/#")) {
+      await clickBackEverywhere();
+      continue;
+    }
+
+    // “こちら” があれば踏む
+    await clickHereEverywhere();
+
+    // main フレーム探索
+    let main = findMain();
+
+    // StartInit がまだなら、main に直接 StartInit を読ませる（ここが肝）
+    if (main && !/akiyaJyoukenStartInit/i.test(main.url())) {
+      try {
+        console.log("[frameset] force load StartInit into main frame");
+        await main.goto(START, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await page.waitForTimeout(800);
+      } catch (e) {
+        console.log("[frameset] main.goto failed:", e.message);
+      }
+    }
+
+    // 最終チェック
+    main = findMain();
+    if (main && /akiyaJyoukenStartInit/i.test(main.url())) {
+      return main;              // ← 取得成功
+    }
+
+    // まだなら次ループ（念のため）
+    await page.waitForTimeout(1000);
   }
 
-  // StartInit を読み込んだ main フレームを探す
-  for (let i = 0; i < 10; i++) {
-    const mf = page.frames().find(f => /akiyaJyoukenStartInit/i.test(f.url()));
-    if (mf) return mf;
-    await page.waitForTimeout(500);
-  }
-  return null;
+  return null;  // 取得失敗（呼び出し側でハンドル）
 }
 
 /* --- ページの進捗判定 --- */
