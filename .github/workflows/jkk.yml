@@ -34,5 +34,6 @@ jobs:
       out/**/*.png
       out/**/*.html
 
+
           if-no-files-found: warn
           retention-days: 7
