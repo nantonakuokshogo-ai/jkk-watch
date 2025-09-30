@@ -7,7 +7,6 @@ on:
       - 'monitor.js'
       - '.github/workflows/jkk.yml'
       - 'package.json'
-      - 'package-lock.json'
 
 jobs:
   run:
@@ -21,11 +20,10 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: '20'   # ← cache は指定しない
 
       - name: Install deps
-        run: npm ci
+        run: npm ci || npm i   # lock があれば ci、無ければ i
 
       - name: Run
         run: node monitor.js
