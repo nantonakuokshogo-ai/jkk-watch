@@ -18,71 +18,99 @@ async function gotoWithRetry(page, url, tries = 3) {
   return false;
 }
 
-// ---- 中継ページ突破（こちら / meta refresh） ----
+// ---- 中継ページ突破（href抽出→meta→強制クリック→座標クリック）----
 async function passRelay(page) {
   console.log('[relay] start');
 
-  const absolutize = async (ctx, href) => {
+  // 相対→絶対
+  const absolutize = (baseUrl, href) => {
     if (!href) return null;
     if (/^https?:\/\//i.test(href)) return href;
-    const baseUrl = ctx.url ? await ctx.url() : page.url();
     const base = new URL(baseUrl);
     return href.startsWith('/')
       ? `${base.origin}${href}`
       : `${base.origin}${base.pathname.replace(/\/[^/]*$/, '/')}${href}`;
   };
 
-  const readHref = async (ctx, label) => {
-    try {
-      let href = await ctx.getByRole('link', { name: /こちら/ }).first().getAttribute('href').catch(() => null);
-      if (!href) href = await ctx.locator('a', { hasText: 'こちら' }).first().getAttribute('href').catch(() => null);
-      if (href && href !== '#') {
-        let url = await absolutize(ctx, href);
-        console.log(`[relay] goto from ${label}: ${url}`);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-        return true;
-      }
-    } catch {}
-    return false;
-  };
-
-  const readMetaRefresh = async (ctx, label) => {
+  // 1) HTMLを直に見て <a ...>こちら</a> の href を抜く（メインと全フレーム）
+  const tryParseHtmlForHref = async (ctx, label) => {
     try {
       const html = await ctx.content();
-      const m = html && html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)/i);
+      // こちらテキストを含むアンカーのhrefを抜く
+      const m = html.match(/<a[^>]+href=["']([^"']+)["'][^>]*>[\s\S]*?こちら[\s\S]*?<\/a>/i);
       if (m && m[1]) {
-        let url = await absolutize(ctx, m[1]);
-        console.log(`[relay] meta refresh from ${label}: ${url}`);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        const abs = absolutize(ctx.url ? await ctx.url() : page.url(), m[1]);
+        console.log(`[relay] parse href from ${label}: ${abs}`);
+        await page.goto(abs, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(()=>{});
         return true;
       }
     } catch {}
     return false;
   };
 
-  // 1) メイン/フレームで href を探す
-  if (await readHref(page, 'main')) { console.log('[relay] href (main) OK'); }
-  else {
-    let done = false;
-    for (const f of page.frames()) {
-      if (await readHref(f, `frame:${await f.url()}`)) { console.log('[relay] href (frame) OK'); done = true; break; }
-    }
-    // 2) 見つからなければ meta refresh
-    if (!done) {
-      if (await readMetaRefresh(page, 'main')) console.log('[relay] meta (main) OK');
-      else {
-        for (const f of page.frames()) {
-          if (await readMetaRefresh(f, `frame:${await f.url()}`)) { console.log('[relay] meta (frame) OK'); break; }
-        }
+  // 2) <meta http-equiv="refresh" ... url=...> を拾う
+  const tryMetaRefresh = async (ctx, label) => {
+    try {
+      const html = await ctx.content();
+      const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)/i);
+      if (m && m[1]) {
+        const abs = absolutize(ctx.url ? await ctx.url() : page.url(), m[1]);
+        console.log(`[relay] meta refresh from ${label}: ${abs}`);
+        await page.goto(abs, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(()=>{});
+        return true;
       }
+    } catch {}
+    return false;
+  };
+
+  // 3) 強制クリック（text=こちら）
+  const tryForceClick = async (ctx, label) => {
+    const loc = ctx.locator('text=こちら');
+    if (await loc.count()) {
+      console.log(`[relay] force click text on ${label}`);
+      try {
+        await Promise.all([
+          ctx.waitForLoadState('domcontentloaded').catch(()=>{}),
+          loc.first().click({ timeout: 3000, force: true })
+        ]);
+        return true;
+      } catch {}
+      // 座標クリック（最終手段）
+      try {
+        const box = await loc.first().boundingBox();
+        if (box) {
+          console.log(`[relay] mouse click (${Math.round(box.x)},${Math.round(box.y)}) on ${label}`);
+          await ctx.mouse.click(box.x + box.width/2, box.y + box.height/2);
+          await ctx.waitForLoadState('domcontentloaded').catch(()=>{});
+          return true;
+        }
+      } catch {}
     }
+    return false;
+  };
+
+  // ===== 順番に試す =====
+  // メイン→全フレーム：HTMLパース
+  if (await tryParseHtmlForHref(page, 'main')) gotoDone(); else {
+    for (const f of page.frames()) { if (await tryParseHtmlForHref(f, `frame:${await f.url()}`)) { gotoDone(); break; } }
+  }
+  // メタリフレッシュ
+  if (page.url() && (await tryMetaRefresh(page, 'main'))) gotoDone(); else {
+    for (const f of page.frames()) { if (await tryMetaRefresh(f, `frame:${await f.url()}`)) { gotoDone(); break; } }
+  }
+  // 強制クリック
+  if (!(await tryForceClick(page, 'main'))) {
+    for (const f of page.frames()) { if (await tryForceClick(f, `frame:${await f.url()}`)) break; }
   }
 
-  // 3) 最後に少し待って状況ログ
-  await page.waitForTimeout(1500);
+  // 少し待って状況をログ
+  await page.waitForTimeout(1200);
   console.log('[relay] after, URL:', page.url());
   for (const f of page.frames()) console.log('[relay] frame:', await f.url());
+
+  function gotoDone(){ /* no-op: 直後の wait とログで確認 */ }
 }
+
 
 // ---- 検索ボタン押下 ----
 async function pressSearch(page) {
