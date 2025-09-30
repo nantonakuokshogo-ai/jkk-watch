@@ -7,6 +7,20 @@ const FRAMESET = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
 const START    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
 const KEYWORD  = "DK";   // 動作確認用。OKになったら本命ワードに変更
 /* ================ */
+const browser = await chromium.launch({
+  headless: true,
+  args: ["--disable-blink-features=AutomationControlled"]
+});
+const context = await browser.newContext({
+  locale: "ja-JP",
+  timezoneId: "Asia/Tokyo",
+  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
+  extraHTTPHeaders: {
+    "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+    "Upgrade-Insecure-Requests": "1"
+  }
+});
+const page = await context.newPage();
 
 async function gotoRetry(page, url, tries = 3) {
   for (let i = 1; i <= tries; i++) {
@@ -81,81 +95,48 @@ async function enterFromHome(page) {
   return true;
 }
 
-/* --- /service/ を開き、main フレームに必ず StartInit を読み込ませる --- */
+// /service/ に一度触れてクッキー確保 → Referer 付きで StartInit 直行 → mainフレーム検出
 async function gotoFrameset(page) {
-  const clickBackEverywhere = async () => {
-    const tryOn = async (ctx) => {
-      const link = ctx.getByRole("link", { name: /トップページへ戻る/ });
-      if (await link.count()) { await link.first().click().catch(()=>{}); return true; }
-      const btn  = ctx.getByRole("button", { name: /トップページへ戻る/ });
-      if (await btn.count())  { await btn.first().click().catch(()=>{});  return true; }
-      return false;
-    };
-    let done = await tryOn(page);
-    if (!done) for (const f of page.frames()) { if (await tryOn(f)) { done = true; break; } }
-    await page.waitForTimeout(600);
-    return done;
-  };
+  const FRAMESET = "https://jhomes.to-kousya.or.jp/search/jkknet/service/";
+  const START    = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
 
-  const clickHereEverywhere = async () => {
-    for (const ctx of [page, ...page.frames()]) {
-      const a = ctx.getByRole("link", { name: /こちら/ });
-      if (await a.count()) {
-        await Promise.all([
-          ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
-          a.first().click().catch(()=>{})
-        ]);
-        await page.waitForTimeout(500);
-      }
+  // 1) /service/ に触って JSESSIONID を得る（おわびでもOK）
+  await gotoRetry(page, FRAMESET);
+  await page.waitForLoadState("domcontentloaded").catch(()=>{});
+
+  // 2) Referer=/service/ を付けて StartInit に直行
+  console.log("[frameset] direct goto StartInit with referer=/service/");
+  await page.goto(START, { waitUntil: "domcontentloaded", timeout: 60000, referer: FRAMESET })
+            .catch(()=>{});
+
+  // 3) “こちら” があれば踏む（出ることがある）
+  for (const ctx of [page, ...page.frames()]) {
+    const here = ctx.getByRole("link", { name: /こちら/ });
+    if (await here.count()) {
+      await Promise.all([
+        ctx.waitForLoadState("domcontentloaded").catch(()=>{}),
+        here.first().click().catch(()=>{})
+      ]);
+      await page.waitForTimeout(600);
     }
-  };
+  }
 
+  // 4) mainフレーム（StartInit）を探す
   const findMain = () => {
     let f = page.frames().find(fr => /akiyaJyoukenStartInit/i.test(fr.url()));
     if (f) return f;
     f = page.frames().find(fr => /(^|\/)main(\.html)?$/i.test(fr.url()) || /main/i.test(fr.name()));
-    if (f) return f;
-    const all = page.frames().filter(fr => fr !== page.mainFrame());
-    return all[0] || null;
+    return f || null;
   };
 
-  for (let t = 1; t <= 5; t++) {
-    console.log(`[frameset] try ${t}`);
-    await gotoRetry(page, FRAMESET);
-    await page.waitForLoadState("domcontentloaded").catch(()=>{});
-
-    const title = (await page.title().catch(()=> "")) || "";
-    if (title.includes("おわび") || title.includes("見つかりません") || page.url().endsWith("/service/#")) {
-      await clickBackEverywhere();
-      continue;
-    }
-
-    await clickHereEverywhere();
-
-    let main = findMain();
-
-    // ここが肝：Referrer を維持しつつ main を StartInit へ遷移
-    if (main && !/akiyaJyoukenStartInit/i.test(main.url())) {
-      try {
-        console.log("[frameset] force load StartInit in main via location.href");
-        await main.evaluate((url) => { location.href = url; }, START);
-        await page.waitForTimeout(800);
-      } catch (e) {
-        console.log("[frameset] main.evaluate failed:", e.message);
-      }
-    }
-
-    main = findMain();
-    if (main && /akiyaJyoukenStartInit/i.test(main.url())) {
-      return main;
-    }
-
-    await dumpAllFrames(page, `debug_frameset_try${t}`);
-    await screenshot(page, `debug_frameset_try${t}.png`);
-    await page.waitForTimeout(1000);
+  for (let i = 0; i < 10; i++) {
+    const mf = findMain();
+    if (mf) return mf;
+    await page.waitForTimeout(500);
   }
-  return null;
+  return null; // 呼出し側でエラー化
 }
+
 
 /* --- ページ進捗判定 --- */
 async function _progressHappened(page, prevUrl, prevTitle) {
