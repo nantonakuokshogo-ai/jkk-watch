@@ -6,7 +6,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15   # ← 全体タイムアウトを15分に延長
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -22,15 +22,15 @@ jobs:
           npm ci || npm i
           npx playwright install --with-deps chromium
 
-      - name: Run
+      - name: Run node monitor.js
         run: node monitor.js
 
-- name: Upload artifacts
-  uses: actions/upload-artifact@v4
-  with:
-    name: page-dump
-    path: |
-      *.png
-      dump/**
-    if-no-files-found: warn
-    retention-days: 7
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-dump
+          path: |
+            *.png
+            dump/**
+          if-no-files-found: warn
+          retention-days: 7
