@@ -1,0 +1,25 @@
+name: JKK Watch (smoke test)
+
+on:
+  workflow_dispatch:    # 手動実行ボタン
+  schedule:
+    - cron: "*/5 * * * *"   # 5分おき（まずはゆるめでOK）
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: node monitor.js
+      - name: Save screenshot (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-screenshot
+          path: out.png
+          if-no-files-found: ignore
