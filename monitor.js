@@ -1,5 +1,18 @@
 // monitor.js  — Playwright 単体で JKK StartInit → 中継突破 → 一覧へ到達する最小ルート
 import { chromium } from "playwright";
+// ❶ 先頭の import の下あたりに追加
+import fs from "fs/promises";
+import path from "path";
+const DUMP_DIR = "dump";
+async function saveHtml(page, name) {
+  try {
+    await fs.mkdir(DUMP_DIR, { recursive: true });
+    const html = await page.content();
+    await fs.writeFile(path.join(DUMP_DIR, `${name}.html`), html, "utf8");
+  } catch (e) {
+    console.error("[dump] save error:", e);
+  }
+}
 
 /* ========================  設定  ======================== */
 const HOME        = "https://jhomes.to-kousya.or.jp/";
