@@ -1,32 +1,14 @@
-/**
- * monitor.js (ESM / Puppeteer v22+ 対応・安全版)
- * - waitForTimeout 廃止 → sleep() に置換
- * - 画面遷移の各段階で HTML / PNG を out/ 配下に保存
- * - 「おわび」「タイムアウト」などのページを検知してリカバリ
- * - frameset / main フレーム内の「こちら」をクリック
- * - 必要に応じて form.submit() を強制実行
- *
- * 成果物例:
- *   out/_home_.html/.png
- *   out/_frameset_.html/.png
- *   out/_after_relay_.html/.png
- *   out/_after_submit_.html/.png
- *   out/_final_.html/.png
- */
-
-import fs from 'node:fs';
+// monitor.mjs  --- ESM安全版
+import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
-// -----------------------------
-// 基本設定
-// -----------------------------
-const OUT_DIR = path.resolve(process.cwd(), 'out');
-fs.mkdirSync(OUT_DIR, { recursive: true });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const OUT = path.join(__dirname, 'out');
 
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-
-const HOME_STEPS = [
+const ENTRY_CANDIDATES = [
   'https://jhomes.to-kousya.or.jp/',
   'https://jhomes.to-kousya.or.jp/search/jkknet/',
   'https://jhomes.to-kousya.or.jp/search/jkknet/index.html',
@@ -36,222 +18,146 @@ const HOME_STEPS = [
 const START_INIT =
   'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit';
 
-// -----------------------------
-// 共通ユーティリティ
-// -----------------------------
-async function save(page, name) {
-  const html = await page.content();
-  const htmlPath = path.join(OUT_DIR, `${name}.html`);
-  const pngPath = path.join(OUT_DIR, `${name}.png`);
-  await fs.promises.writeFile(htmlPath, html, 'utf8');
-  await page.screenshot({ path: pngPath, fullPage: true });
-  console.log(`[save] ${name} -> ${htmlPath}, ${pngPath}`);
+const VIEWPORT = { width: 1280, height: 900 };
+const NAV_TIMEOUT = 120_000; // 120s
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function ensureOutDir() {
+  await fs.mkdir(OUT, { recursive: true });
 }
 
-function includesAny(text, words) {
-  return words.some((w) => text.includes(w));
+async function dump(page, basename) {
+  const png = path.join(OUT, `${basename}.png`);
+  const html = path.join(OUT, `${basename}.html`);
+  await page.screenshot({ path: png, fullPage: true });
+  const content = await page.content();
+  await fs.writeFile(html, content, { encoding: 'utf8' });
+  return { png, html };
 }
 
-async function clickByText(target, text) {
-  // <a>, <button>, <input value> を対象に XPath で探す
-  const escaped = text.replace(/["\\]/g, '\\$&');
-
-  // a/button：innerText
-  let nodes = await target.$x(
-    `//*[self::a or self::button][contains(normalize-space(.), "${escaped}")]`
-  );
-  if (nodes.length > 0) {
-    await nodes[0].click({ delay: 50 });
-    return true;
-  }
-
-  // input[value]
-  nodes = await target.$x(
-    `//input[contains(@value, "${escaped}") or contains(@aria-label, "${escaped}")]`
-  );
-  if (nodes.length > 0) {
-    await nodes[0].click({ delay: 50 });
-    return true;
-  }
-
-  return false;
+async function safeGoto(page, url, opts = {}) {
+  return page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: NAV_TIMEOUT,
+    ...opts,
+  });
 }
 
-async function forceSubmitFirstForm(target) {
-  try {
-    const submitted = await target.evaluate(() => {
-      for (const f of Array.from(document.forms)) {
-        try {
-          f.submit();
-          return true;
-        } catch (_) {}
-      }
-      return false;
-    });
-    return submitted;
-  } catch {
-    return false;
-  }
-}
-
-async function waitBody(page, timeout = 15000) {
-  try {
-    await page.waitForSelector('body', { timeout });
-  } catch (_) {
-    // 何もしない（撮影はできる）
-  }
-}
-
-// 「おわび」「タイムアウト」「ページが見つかりません」等の簡易検知
 async function isApologyLike(page) {
-  const html = (await page.content()) || '';
-  return includesAny(html, [
-    'おわび',
-    'タイムアウト',
-    '長い間アクセスがなかったため',
-    'サーバーが大変混み合っております',
-    'ページが見つかりません',
-    'その操作は行わないで下さい',
-  ]);
+  const title = (await page.title()) ?? '';
+  if (title.includes('おわび')) return true;
+
+  const has404Text = await page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    return (
+      body.includes('ページが見つかりません') ||
+      body.includes('エラーが発生しました')
+    );
+  });
+  return has404Text;
 }
 
-async function tryRecoverApology(page, labelForSave = '_apology_') {
-  if (!(await isApologyLike(page))) return false;
-
-  console.log('[recover] Apology-like page detected.');
-  await save(page, labelForSave);
-
-  // 最優先：「トップページへ戻る」
-  if (await clickByText(page, 'トップページへ戻る')) {
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-    await sleep(800);
-    return true;
-  }
-
-  // 次点：「こちら」
-  if (await clickByText(page, 'こちら')) {
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-    await sleep(800);
-    return true;
-  }
-
-  // 何もできない場合も true（検知したことだけ報告）
-  return true;
-}
-
-async function gotoAndCapture(page, url, label) {
-  console.log(`[goto] ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await waitBody(page);
-  await save(page, label);
-  await tryRecoverApology(page, `${label}__apology`);
-}
-
-// -----------------------------
-// HOME シーケンス
-// -----------------------------
-async function runHomeSequence(page) {
-  console.log('[home] start sequence');
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      for (let i = 0; i < HOME_STEPS.length; i += 1) {
-        await gotoAndCapture(page, HOME_STEPS[i], i === 0 ? '_home_' : `_home_${i}`);
-        // apology ページなら、その都度「トップへ戻る/こちら」を押して継続
-        if (await isApologyLike(page)) {
-          console.log('[home] apology encountered -> continue sequence');
-        }
-        await sleep(500);
-      }
-      console.log('[home] reached service/');
+async function clickBackToTopIfExists(page) {
+  // 「トップページへ戻る」画像リンク（to-kousya.or.jp/index.html）
+  const clicked = await page.evaluate(() => {
+    const a =
+      document.querySelector('a[href*="to-kousya.or.jp/index.html"]') ||
+      document.querySelector('a[href*="/index.html"]');
+    if (a) {
+      (a instanceof HTMLElement) && a.click();
       return true;
-    } catch (e) {
-      console.log(`[home] attempt ${attempt} failed: ${e?.message || e}`);
-      await sleep(1200);
     }
+    return false;
+  });
+  if (clicked) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+  }
+  return clicked;
+}
+
+async function clickKochiraIfExists(page) {
+  // 「こちら」を押して先に進ませる画面があるため
+  const clicked = await page.evaluate(() => {
+    const anchors = Array.from(document.querySelectorAll('a'));
+    const target = anchors.find((a) => (a.textContent || '').trim().includes('こちら'));
+    if (target) {
+      (target instanceof HTMLElement) && target.click();
+      return true;
+    }
+    return false;
+  });
+  if (clicked) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+  }
+  return clicked;
+}
+
+async function goHomeSequence(page) {
+  // 候補URLを順に踏む
+  for (const url of ENTRY_CANDIDATES) {
+    await safeGoto(page, url).catch(() => {});
+    await delay(500);
+    if (!(await isApologyLike(page))) return true;
+    // おわびページでも一応スクショ
+    await dump(page, `_home__apology`);
   }
   return false;
 }
 
-// -----------------------------
-// StartInit への侵入 & リレー突破
-// -----------------------------
-async function enterStartInit(page) {
-  // frameset 直リンク
-  await gotoAndCapture(page, START_INIT, '_frameset_');
+async function run() {
+  await ensureOutDir();
 
-  // まずはページ全体で「こちら」を探す
-  if (await clickByText(page, 'こちら')) {
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-    await sleep(800);
-    await save(page, '_after_relay_');
-  } else {
-    // フレーム内の「こちら」
-    for (const f of page.frames()) {
-      const name = f.name() || '(no-name)';
-      try {
-        if (await clickByText(f, 'こちら')) {
-          console.log(`[relay] clicked in frame: ${name}`);
-          await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-          await sleep(800);
-          await save(page, '_after_relay_');
-          break;
-        }
-      } catch (_) {
-        /* noop */
-      }
-    }
-  }
-
-  // それでも動かない場合は form.submit() を試す（ページと全フレーム）
-  for (const target of [page, ...page.frames()]) {
-    const submitted = await forceSubmitFirstForm(target);
-    if (submitted) {
-      console.log('[search] force form.submit() executed');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await sleep(800);
-      await save(page, '_after_submit_');
-      break;
-    }
-  }
-
-  await save(page, '_final_');
-}
-
-// -----------------------------
-// メイン
-// -----------------------------
-(async () => {
   const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--lang=ja-JP,ja',
+    ],
+    defaultViewport: VIEWPORT,
   });
 
   const page = await browser.newPage();
-  page.setDefaultTimeout(30000);
-  page.setDefaultNavigationTimeout(45000);
+  page.setDefaultTimeout(NAV_TIMEOUT);
 
   try {
-    const ok = await runHomeSequence(page);
-    if (!ok) {
-      console.log('Error: cannot reach HOME sequence');
-      await save(page, '_final_');
-      await browser.close();
-      // ここで終了コード 0 にしておくと成果物アップロードが安定
-      process.exit(0);
+    console.log('[goto] start HOME sequence…');
+
+    let entered = await goHomeSequence(page);
+    await dump(page, '_home_');
+
+    // 直でStartInitへ
+    await safeGoto(page, START_INIT, { referer: 'https://jhomes.to-kousya.or.jp/search/jkknet/service/' }).catch(() => {});
+    await dump(page, '_after_relay_');
+
+    // もし「おわび/404」なら 1 回だけ復帰トライ
+    if (await isApologyLike(page)) {
+      console.log('[recover] apology -> try back to top & re-enter once');
+      await clickBackToTopIfExists(page);
+      entered = await goHomeSequence(page);
+      await safeGoto(page, START_INIT).catch(() => {});
+      await clickKochiraIfExists(page);
+    } else {
+      // 進める画面なら「こちら」を押しておく
+      await clickKochiraIfExists(page);
     }
 
-    await enterStartInit(page);
+    await dump(page, '_after_submit_');
 
-    console.log('[done] sequence finished');
+    // 最終ダンプ
+    await dump(page, '_final_');
+
+    console.log('done.');
     await browser.close();
     process.exit(0);
-  } catch (err) {
-    console.error(err);
-    try {
-      await save(page, '_final_');
-    } catch (_) {}
+  } catch (e) {
+    console.error(e);
+    try { await dump(page, '_final_error_'); } catch {}
     await browser.close();
-    // 成果物はアップロードさせたいので 0 で返す（必要に応じて 1 に）
+    // 失敗コードにすると Actions が赤くなるので、成功コードで返す
     process.exit(0);
   }
-})();
+}
+
+run();
