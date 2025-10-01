@@ -2,6 +2,18 @@ name: run
 
 on:
   workflow_dispatch:
+    inputs:
+      kana:
+        description: "住宅名(カナ) に入れる文字"
+        required: false
+        default: "コーシャハイム"
+  # 必要ならスケジュールも（UTC）
+  # schedule:
+  #   - cron: "15 0 * * *"  # 毎日09:15(JST)
+
+concurrency:
+  group: jkk-monitor
+  cancel-in-progress: true
 
 jobs:
   monitor:
@@ -14,50 +26,37 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
+          # cache: npm  ← lockfileが無いと失敗するので使わない
 
       - name: Install Google Chrome
         run: |
-          set -eux
           sudo apt-get update
           sudo apt-get install -y wget gnupg
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | \
-            sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" | \
-            sudo tee /etc/apt/sources.list.d/google-chrome.list
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
-          google-chrome-stable --version || true
-          command -v google-chrome || true
-          command -v google-chrome-stable || true
-          ls -l /usr/bin/google-chrome* || true
+          google-chrome --version
 
-      - name: Discover Chrome path (export to env)
+      - name: Install deps (puppeteer-core)
         run: |
-          set -eux
-          BIN="$(command -v google-chrome || true)"
-          if [ -z "$BIN" ]; then
-            BIN="$(command -v google-chrome-stable || true)"
+          if [ ! -f package.json ]; then
+            npm init -y
           fi
-          if [ -z "$BIN" ]; then
-            echo "Chrome binary not found on PATH" >&2
-            exit 1
-          fi
-          echo "Found Chrome at: $BIN"
-          echo "PUPPETEER_EXECUTABLE_PATH=$BIN" >> $GITHUB_ENV
+          npm i puppeteer-core
 
-      - name: Install deps
-        run: npm i --no-audit --no-fund
+      - name: Run monitor
+        run: node monitor.mjs
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          JKK_KANA: ${{ github.event.inputs.kana || 'コーシャハイム' }}
 
-    - name: Run monitor
-      run: node monitor.mjs
-      env:
-        CHROME_PATH: /usr/bin/google-chrome
-        JKK_KANA: コーシャハイム
-        
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
           path: out/**
+          if-no-files-found: warn
+          retention-days: 7
