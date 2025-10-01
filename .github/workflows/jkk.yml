@@ -1,10 +1,12 @@
-# .github/workflows/jkk.yml
 name: run
-on: { workflow_dispatch: {} }
+
+on:
+  workflow_dispatch:
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -12,34 +14,24 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"   # ← cache は指定しない
+          node-version: '20'
 
-      - name: Setup Chrome
-        id: chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Resolve Chrome path
-        shell: bash
+      - name: Install Google Chrome
         run: |
-          set -eo pipefail
-          CHROME_BIN="${{ steps.chrome.outputs.chrome-path }}"
-          if [ -n "$CHROME_BIN" ] && [ ! -x "$CHROME_BIN" ]; then
-            CHROME_BIN="$(command -v "$CHROME_BIN" || true)"
-          fi
-          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v google-chrome || true)"
-          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v google-chrome-stable || true)"
-          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v chromium || true)"
-          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v chromium-browser || true)"
-          echo "Using CHROME_PATH=$CHROME_BIN"
-          test -x "$CHROME_BIN"
-          echo "CHROME_PATH=$CHROME_BIN" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | \
+            sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" | \
+            sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
 
       - name: Install deps
-        run: npm install --no-audit --no-fund
+        run: npm i --no-audit --no-fund
 
-      - name: Run
+      - name: Run monitor
         run: node monitor.mjs
 
       - name: Upload artifacts
