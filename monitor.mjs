@@ -1,4 +1,4 @@
-// monitor.mjs — JKK 先着順あき家検索：ポップアップ封じ（window.open を同一タブ遷移へ）＆全フレーム探索
+// monitor.mjs — JKK 先着順あき家検索：ポップアップ封じ（window.open 同一タブ化）＋全フレーム探索
 import puppeteer from 'puppeteer-core';
 import fs from 'fs/promises';
 import path from 'path';
@@ -53,7 +53,7 @@ async function clickTextIn(frameOrPage, text){
   const ok = await frameOrPage.evaluate((t)=>{
     const N=s=>String(s||'').replace(/\s+/g,'');
     const els=[...document.querySelectorAll('a,button,input[type="submit"],input[type="button"],input[type="image"]')];
-    const el = els.find(e=> N(e.value||e.textContent||e.alt||'').includes(N(t)));
+    const el = els.find(e=> N(e.value||e.textContent||e.getAttribute('alt')||'').includes(N(t)));
     if (el){ (el instanceof HTMLElement) && el.click(); return true; }
     return false;
   }, text);
@@ -93,14 +93,14 @@ async function pickKanaSelectorInFrame(frame){
     const N=(s)=>String(s||'').replace(/[\s\u3000\r\n\t]+/g,'').replace(/[()（）［］\[\]【】<＞<>:：・*＊]/g,'');
     const isKanaLabel = (t)=>{ const n=N(t); return n.includes('住宅名カナ') || (n.includes('住宅名')&&n.includes('カナ')); };
 
-    // label[for]
+    // 1) label[for]
     for (const lab of Array.from(document.querySelectorAll('label'))){
       if (isKanaLabel(lab.textContent||'')){
         const id = lab.getAttribute('for');
         if (id) return `#${CSS.escape(id)}`;
       }
     }
-    // 表の同一行
+    // 2) 表の同一行
     for (const cell of Array.from(document.querySelectorAll('td,th'))){
       if (isKanaLabel(cell.textContent||'')){
         const tr = cell.closest('tr');
@@ -114,7 +114,7 @@ async function pickKanaSelectorInFrame(frame){
         }
       }
     }
-    // フォールバック
+    // 3) フォールバック（name/aria-label/title にカナ）
     const fb = Array.from(document.querySelectorAll('input[type="text"],input:not([type]),input[type="search"]'))
       .find(el=> /カナ|kana|ｶﾅ/i.test([el.name, el.id, el.title, el.getAttribute('aria-label')].join('')));
     if (fb){
@@ -159,14 +159,19 @@ async function main(){
     const page = await browser.newPage();
     await ensureViewport(page);
 
-    // ★ 重要：window.open を“同一タブ遷移”に書き換え（ポップアップを封じる）
-    await page.addInitScript(() => {
+    // ★ Puppeteer では addInitScript ではなく evaluateOnNewDocument を使う
+    await page.evaluateOnNewDocument(() => {
       const origOpen = window.open;
+      // StartInit や wait.jsp が window.open を使っても“同一タブ遷移”にする
       window.open = function(url){ try{ location.href = url; }catch(e){} return window; };
-      // submitNext() が window.open を使っても同一タブで遷移させる
+      // 念のため target=_blank のリンクも同一タブに
+      document.addEventListener('click', (e) => {
+        const a = e.target && (e.target.closest && e.target.closest('a[target="_blank"]'));
+        if (a) { e.preventDefault(); location.href = a.href; }
+      }, true);
     });
 
-    // 入口を正しい順序で辿る（Referer が重要）
+    // 入口を正しい順序で辿る（Referer 重要）
     await goto(page, '/');                             await save(page, 'home_1');
     await goto(page, '/search/jkknet/');              await save(page, 'home_1_after');
     await goto(page, '/search/jkknet/index.html');    await save(page, 'home_2');
@@ -177,15 +182,13 @@ async function main(){
     await goto(page, '/search/jkknet/service/akiyaJyoukenStartInit', '/search/jkknet/service/');
     await save(page, 'frameset_startinit');
 
-    // まず「こちら」をクリックしてみる
+    // 「こちら」クリック → submitNext() → wait.jsp 直遷移 の順に総当たり
     await clickTextIn(page, 'こちら');
-    await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 10000}).catch(()=>{});
-    await save(page, 'after_relay_1');
+    await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 12000}).catch(()=>{});
 
-    // まだ StartInit 表示なら submitNext() → それも無理なら wait.jsp に直で入る
     if ((await page.content()).includes('自動で次の画面') || page.url().includes('akiyaJyoukenStartInit')){
       await page.evaluate(()=>{ try{ if (typeof submitNext==='function') submitNext(); }catch(e){} });
-      await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 8000}).catch(()=>{});
+      await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 10000}).catch(()=>{});
     }
     if ((await page.content()).includes('自動で次の画面') || page.url().includes('akiyaJyoukenStartInit')){
       await goto(page, '/search/jkknet/wait.jsp', '/search/jkknet/service/akiyaJyoukenStartInit');
@@ -205,7 +208,7 @@ async function main(){
     await dumpAllFrames(page, 'before');
     let sFrame = await pickSearchFrame(page);
     if (!sFrame){
-      // もし mainFrame にフォームが直載りならそれも考慮
+      // mainFrame 直載りの可能性も見る
       sFrame = page.mainFrame();
     }
 
