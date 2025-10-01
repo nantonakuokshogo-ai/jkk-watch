@@ -11,31 +11,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
       - name: Install Google Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable || true
-          if ! command -v google-chrome >/dev/null; then
-            sudo apt-get install -y google-chrome || true
-          fi
-          which google-chrome || true
-          google-chrome --version || true
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Install deps (puppeteer-core only)
         run: |
-          npm i --no-audit --no-fund puppeteer-core@22
+          npm init -y >/dev/null 2>&1 || true
+          npm i puppeteer-core@22
 
-      - name: Run monitor
+      - name: Run monitor.mjs
         env:
-          CHROME_PATH: /usr/bin/google-chrome
+          PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
         run: node monitor.mjs
 
-      - name: Upload artifacts (out/)
+      - name: Upload out/**
         if: always()
         uses: actions/upload-artifact@v4
         with:
