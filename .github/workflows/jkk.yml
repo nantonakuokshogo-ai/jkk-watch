@@ -52,11 +52,15 @@ jobs:
           CHROME_PATH: /usr/bin/google-chrome
           JKK_KANA: ${{ github.event.inputs.kana || 'コーシャハイム' }}
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: out
-          path: out/**
+  - name: Upload artifacts
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: jkk-watch
+    path: |
+      out/**
+      ./*.html
+      ./*.png
+      ./*.json
           if-no-files-found: warn
           retention-days: 7
