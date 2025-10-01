@@ -1,32 +1,29 @@
 name: run
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     paths:
-      - 'monitor.js'
-      - '.github/workflows/jkk.yml'
-      - 'package.json'
+      - "monitor.mjs"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/jkk.yml"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'   # ← cache は指定しない
+          node-version: "20"
 
       - name: Install deps
-        run: npm ci || npm i   # lock があれば ci、無ければ i
+        run: npm ci --no-audit --no-fund
 
-      - name: Run
-        run: node monitor.js
+      - name: Run monitor
+        run: node monitor.mjs
 
       - name: Upload artifacts
         if: always()
