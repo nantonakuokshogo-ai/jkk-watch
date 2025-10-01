@@ -1,5 +1,5 @@
 // monitor.mjs
-// JKK: 「住宅名(カナ) = コーシャハイム」で検索実行して、画面HTML/スクショを out/ に保存します。
+// 「住宅名(カナ) = コーシャハイム」で検索→ out/ に HTML と PNG を保存
 
 import fs from "fs/promises";
 import path from "path";
@@ -13,7 +13,6 @@ const OUT = path.join(__dirname, "out");
 const BASE = "https://jhomes.to-kousya.or.jp";
 const START_INIT = BASE + "/search/jkknet/service/akiyaJyoukenStartInit";
 
-// ===== helpers =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function ensureOut() {
@@ -21,20 +20,20 @@ async function ensureOut() {
 }
 async function save(page, name) {
   await ensureOut();
-  const html = await page.content();
+  try {
+    // viewport が 0 幅問題の保険
+    await page.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 }).catch(() => {});
+  } catch {}
+  const html = await page.content().catch(() => "<!---->");
   await fs.writeFile(path.join(OUT, `${name}.html`), html);
-  // 0 width 対策: viewport を必ず設定した上で撮る
-  const vp = page.viewport();
-  if (!vp || !vp.width || !vp.height) {
-    await page.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 });
-  }
-  await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+  try {
+    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+  } catch {}
   console.log(`[saved] ${name}`);
 }
-
 async function gotoAndSave(page, url, name, referer) {
   if (referer) {
-    await page.setExtraHTTPHeaders({ Referer: referer });
+    await page.setExtraHTTPHeaders({ Referer: referer }).catch(() => {});
   }
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await save(page, name);
@@ -51,67 +50,71 @@ async function launch() {
   const browser = await puppeteer.launch({
     executablePath,
     headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      "--window-size=1280,2000",
-    ],
+    args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--window-size=1280,2000"],
     defaultViewport: { width: 1280, height: 1800, deviceScaleFactor: 1 },
   });
   return browser;
 }
 
-// 住宅名(カナ) の入力ボックスを探す（複数パターンに対応）
+// 住宅名(カナ) の入力欄を色々な書き方で探す
 async function findKanaInput(page) {
-  // 1) name 直指定
   let h = await page.$('input[name="jyutakuKanaName"]');
   if (h) return h;
-
-  // 2) id/partial name
-  h = await page.$('input#jyutakuKanaName, input[name*="Kana"]');
+  h = await page.$('input#jyutakuKanaName');
   if (h) return h;
-
-  // 3) ラベル文言の直後の input
-  const xpath =
-    "//*[contains(normalize-space(.),'住宅名') and contains(normalize-space(.),'カナ')]/following::input[1]";
-  const xs = await page.$x(xpath);
+  h = await page.$('input[name*="Kana"]');
+  if (h) return h;
+  const xs = await page.$x(
+    "//*[contains(normalize-space(.),'住宅名') and contains(normalize-space(.),'カナ')]/following::input[1]"
+  );
   if (xs && xs.length) return xs[0];
-
   return null;
 }
 
 async function clickSearch(page) {
-  // いろいろな「検索」ボタンに対応
-  const xpaths = [
-    // input / button / image
-    "//input[( @type='submit' or @type='button' or @type='image') and (contains(@value,'検索') or contains(@alt,'検索') or contains(@title,'検索'))]",
-    "//button[contains(.,'検索')]",
-    "//a[contains(.,'検索する') or contains(.,'検索')]",
-  ];
-  for (const xp of xpaths) {
+  const tryX = async (xp) => {
     const hit = await page.$x(xp);
     if (hit && hit.length) {
       await hit[0].click();
       return true;
     }
+    return false;
+  };
+  if (
+    (await tryX(
+      "//input[( @type='submit' or @type='button' or @type='image') and (contains(@value,'検索') or contains(@alt,'検索') or contains(@title,'検索'))]"
+    )) ||
+    (await tryX("//button[contains(.,'検索')]")) ||
+    (await tryX("//a[contains(.,'検索する') or contains(.,'検索')]"))
+  ) {
+    return true;
   }
   return false;
+}
+
+// 新しいウィンドウ/タブ（popup）を「ページ数の増加」で待つ
+async function waitForNewPage(browser, prevCount, timeout = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const pages = await browser.pages();
+    if (pages.length > prevCount) {
+      return pages[pages.length - 1];
+    }
+    await sleep(200);
+  }
+  return null;
 }
 
 async function main() {
   const browser = await launch();
   const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 }).catch(() => {});
+
   try {
-    // --- TOP → service へ（Referer 必須なため順路で辿る） ---
+    // 参照元を保ちながら順路で到達
     await gotoAndSave(page, BASE + "/", "home_1");
     await gotoAndSave(page, BASE + "/search/jkknet/", "home_1_after", BASE + "/");
-    await gotoAndSave(
-      page,
-      BASE + "/search/jkknet/index.html",
-      "home_2",
-      BASE + "/search/jkknet/"
-    );
+    await gotoAndSave(page, BASE + "/search/jkknet/index.html", "home_2", BASE + "/search/jkknet/");
     await gotoAndSave(
       page,
       BASE + "/search/jkknet/service/",
@@ -119,24 +122,20 @@ async function main() {
       BASE + "/search/jkknet/index.html"
     );
 
-    // --- StartInit（中継ページ） ---
+    // StartInit（中継）
     await gotoAndSave(page, START_INIT, "frameset_startinit", BASE + "/search/jkknet/service/");
 
-    // このページは「数秒後に自動で次へ」「window.openでJKKnetウィンドウを開く」タイプ。
-    // → forwardForm を submit させ、popup(Page) を待つ。
-    // まず、popup イベントを待ち受け
-    const popupPromise = page.waitForEvent("popup", { timeout: 15000 }).catch(() => null);
+    // popup を待つ（レガシー互換）
+    const beforePages = await browser.pages();
 
-    // 中継ページで submit を強制実行
+    // 中継ページで submit を強制
     await page.evaluate(() => {
-      // after_relay_1 パターン：submitNext() が用意されている
       if (typeof window.submitNext === "function") {
         window.submitNext();
         return;
       }
-      // フォーム直叩きパターン
       const f =
-        document.forms.forwardForm ||
+        (document.forms && (document.forms.forwardForm || document.forms[0])) ||
         document.querySelector('form[name="forwardForm"]') ||
         document.querySelector("form");
       if (f) {
@@ -145,66 +144,59 @@ async function main() {
       }
     });
 
-    // popup を取得（なければ、同タブ遷移の可能性を見る）
-    let searchPage = await popupPromise;
+    // 新しいページが開くか待つ（なければ同タブ継続）
+    let searchPage = await waitForNewPage(browser, beforePages.length, 15000);
     if (!searchPage) {
-      // 同タブに wait.jsp → 検索フォームが出てくるかを待つ
+      // 同タブ遷移
       await save(page, "after_relay_1");
-      // 検索入力が同タブで現れるか 10 秒待機
-      for (let i = 0; i < 20; i++) {
-        const found = await findKanaInput(page);
-        if (found) {
-          searchPage = page;
-          break;
-        }
+      // wait.jsp → 本体へ移るまで少し待つ
+      for (let i = 0; i < 30; i++) {
+        const url = page.url();
+        if (!/wait\.jsp/.test(url)) break;
         await sleep(500);
       }
+      searchPage = page;
     } else {
-      await searchPage.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 });
-      // wait.jsp → 本体へ切り替わるのを待つ（最大 15 秒）
+      await searchPage.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 }).catch(
+        () => {}
+      );
+      await save(searchPage, "after_relay_1");
+      // wait.jsp の間は少し待つ
       for (let i = 0; i < 30; i++) {
         const url = searchPage.url();
-        if (!/wait\.jsp/.test(url)) {
-          // 本体に来たっぽいので break
-          break;
-        }
+        if (!/wait\.jsp/.test(url)) break;
         await sleep(500);
       }
     }
 
-    if (!searchPage) {
-      await save(page, "final_error");
-      throw new Error("検索フォームのウィンドウ(またはタブ)を取得できませんでした。");
-    }
-
-    // ここからは検索ページ上で操作
     await save(searchPage, "before_fill");
 
-    // 住宅名(カナ) を探す
-    const kanaInput = await findKanaInput(searchPage);
-    if (!kanaInput) {
+    // 住宅名(カナ) を入力
+    const kana = await findKanaInput(searchPage);
+    if (!kana) {
       await save(searchPage, "final_error");
       throw new Error("住宅名(カナ) の入力欄が見つかりませんでした。");
     }
+    try {
+      await kana.click({ clickCount: 3 });
+    } catch {}
+    await kana.type("コーシャハイム", { delay: 20 });
 
-    await kanaInput.click({ clickCount: 3 }).catch(() => {});
-    await kanaInput.type("コーシャハイム", { delay: 20 });
-
-    // 「検索」を押下
-    const clicked = await clickSearch(searchPage);
-    if (!clicked) {
+    // 検索クリック
+    const ok = await clickSearch(searchPage);
+    if (!ok) {
       await save(searchPage, "final_error");
       throw new Error("検索ボタンが見つかりませんでした。");
     }
 
-    // 結果描画待ち（緩め）
-    await searchPage.waitForNetworkIdle({ idleTime: 800, timeout: 15000 }).catch(() => {});
+    // 軽く待って保存（レガシー互換でポーリング）
+    for (let i = 0; i < 20; i++) {
+      await sleep(500);
+    }
     await save(searchPage, "after_submit_main");
-
-    // 最後に現状ページも保存
     await save(searchPage, "final");
   } catch (e) {
-    console.error("Error:", e.message || e);
+    console.error("Error:", e && e.message ? e.message : e);
     try {
       await save(page, "final_error");
     } catch {}
