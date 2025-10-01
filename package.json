@@ -1,11 +1,10 @@
 {
   "name": "jkk-watch",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "start": "node monitor.mjs"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "puppeteer": "^23.5.0"
+    "puppeteer": "^23.7.0"
   }
 }
