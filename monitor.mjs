@@ -1,4 +1,4 @@
-// monitor.mjs — Puppeteer v23+ 安定版（ナビ待ちを非致命化）
+// monitor.mjs — Puppeteer v23+ / popup捕捉強化・安定版
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +8,7 @@ import puppeteer from 'puppeteer';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== 設定 =====
+// ====== 設定 ======
 const OUT_DIR = path.join(__dirname, 'out');
 const BASE = 'https://jhomes.to-kousya.or.jp';
 const TRY_URLS = [
@@ -19,12 +19,13 @@ const TRY_URLS = [
 ];
 const START_INIT = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
 
-// 待ち系
-const NAV_TIMEOUT = 20_000;        // クリック後の短いナビ待ち
-const PAGE_TIMEOUT = 90_000;       // ページ操作タイムアウト
-const PROTOCOL_TIMEOUT = 180_000;  // CDP プロトコル
+// タイムアウト（少し長めに）
+const NAV_TIMEOUT = 20_000;         // クリック後の短いナビ待ち
+const PAGE_TIMEOUT = 90_000;        // ページ操作タイムアウト
+const PROTOCOL_TIMEOUT = 180_000;   // CDP タイムアウト
+const POPUP_TIMEOUT = 20_000;       // popup 待ち
 
-// ===== 共通ユーティリティ =====
+// ====== ユーティリティ ======
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ensureDir = (d) => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); };
 
@@ -42,37 +43,29 @@ async function goto(page, url, name) {
   await snap(page, name);
 }
 
-// ▼ クリック → “起きたら”だけ軽く待つ（起きなくてもOK・タイムアウトは握りつぶす）
+// クリック → 起きたらだけ軽く待つ（起きなくてもOK）
 async function clickByTextWithNav(page, text) {
   try {
     const before = page.url();
     const clicked = await page.evaluate((txt) => {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const nodes = [
-        ...document.querySelectorAll('a,button,input[type="submit"],input[type="button"]'),
-      ];
+      const nodes = [...document.querySelectorAll('a,button,input[type="submit"],input[type="button"]')];
       for (const el of nodes) {
         const label = norm(el.innerText || el.value || el.getAttribute('aria-label') || '');
         if (label.includes(txt)) { el.click(); return true; }
       }
       return false;
     }, text);
-
     if (!clicked) return false;
 
-    // URL変化 or ナビ発生 or timeout(=何も起きなかった) のいずれか早い方
     await Promise.race([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null),
       page.waitForURL(u => u !== before, { timeout: NAV_TIMEOUT }).catch(() => null),
       sleep(NAV_TIMEOUT),
     ]);
-
     await sleep(600);
     return true;
-  } catch {
-    // ここで例外を投げない（次の手へ進ませる）
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function recoverApology(page) {
@@ -84,7 +77,70 @@ async function recoverApology(page) {
   return false;
 }
 
-// ===== メイン =====
+// ==== popup 捕捉（最重要）====
+// 1) 「こちら」クリック前に popup 待ちを開始
+// 2) クリック／submit をトリガー
+// 3) popup が来たらそれを返す。来ない時は全ページ走査で拾う。
+async function clickAndCatchPopup(browser, page, triggerFn, tagPrefix) {
+  // 既存タブの記録
+  const beforePages = await browser.pages();
+
+  // 先に待受
+  const popupP = page.waitForEvent('popup', { timeout: POPUP_TIMEOUT }).catch(() => null);
+
+  // トリガー（「こちら」クリック or form.submit など）
+  let triggered = false;
+  try { triggered = await triggerFn(); } catch { triggered = false; }
+
+  // まずは待受の結果を待つ
+  let popup = await popupP;
+
+  // 来なかったら新規タブ走査（待ってから差分を見る）
+  if (!popup) {
+    await sleep(1200);
+    const afterPages = await browser.pages();
+    const extra = afterPages.filter(p => !beforePages.includes(p));
+    // URL が wait.jsp / service/… っぽいものを優先
+    for (const p of extra) {
+      const u = p.url();
+      if (/wait\.jsp/.test(u) || /\/search\/jkknet\/service\//.test(u)) {
+        popup = p; break;
+      }
+    }
+    // それでも無ければ、新しいものから1つ選ぶ
+    if (!popup && extra.length) popup = extra[extra.length - 1];
+  }
+
+  if (popup) {
+    await snap(popup, `${tagPrefix}_popup_after_open`);
+    // popup 内で自動遷移が起きることがあるので少し待つ
+    await Promise.race([
+      popup.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null),
+      sleep(1500),
+    ]);
+    await snap(popup, `${tagPrefix}_popup_after_wait`);
+    return popup;
+  } else {
+    await snap(page, `${tagPrefix}_popup_missing`);
+    return null;
+  }
+}
+
+// popup 側で “進まない時” の最終手段：form.submit()
+async function forceSubmitIn(ctx, pageForSnap, label) {
+  let submitted = false;
+  try {
+    submitted = await ctx.evaluate(() => {
+      const f = document.forms?.[0] || document.querySelector('form');
+      if (f) { f.submit(); return true; }
+      return false;
+    });
+  } catch {}
+  await sleep(submitted ? 1200 : 300);
+  await snap(pageForSnap, `${label}_after_submit`);
+  return submitted;
+}
+
 async function main() {
   ensureDir(OUT_DIR);
 
@@ -99,46 +155,43 @@ async function main() {
   page.setDefaultNavigationTimeout(PAGE_TIMEOUT);
 
   try {
-    // 1) HOME 周りを順にトライ
+    // 1) HOME を順に
     for (let i = 0; i < TRY_URLS.length; i++) {
       await goto(page, TRY_URLS[i], `home_${i + 1}`);
       await recoverApology(page);
       await snap(page, `home_${i + 1}_after`);
     }
 
-    // 2) frameset を飛ばして StartInit
-    console.log('[frameset] direct goto StartInit with referer=/service/');
+    // 2) StartInit（referer必須）
     await page.setExtraHTTPHeaders({ referer: `${BASE}/search/jkknet/service/` });
     await goto(page, START_INIT, 'frameset_startinit');
 
-    // 3) 「こちら」を最大 4 回試す（遷移しなくてもOK）
-    for (let t = 1; t <= 4; t++) {
-      const clicked = await clickByTextWithNav(page, 'こちら');
-      await snap(page, `after_relay_${t}`);
-      if (!clicked) break;
+    // 3) 「こちら」→ popup 捕捉
+    const popup = await clickAndCatchPopup(
+      browser,
+      page,
+      async () => await clickByTextWithNav(page, 'こちら'),
+      'relay1'
+    );
+
+    // 4) popup が来たら、そこで待つ／submit を保険で実行
+    if (popup) {
+      // 自動で進まない時は submit を保険で
+      await forceSubmitIn(popup, page, 'popup');
+
+      // さらに少し様子見
+      await Promise.race([
+        popup.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null),
+        sleep(1500),
+      ]);
+      await snap(popup, 'popup_final');
+
+    } else {
+      // popup 不発なら、ページ本体で submit を試す（古い実装の保険）
+      await forceSubmitIn(page, page, 'main');
     }
 
-    // 4) form submit（本体と子フレーム）— submit 後は軽く待つだけ
-    const trySubmitIn = async (ctx, mark) => {
-      let submitted = false;
-      try {
-        submitted = await ctx.evaluate(() => {
-          const f = document.querySelector('form');
-          if (f) { f.submit(); return true; }
-          return false;
-        });
-      } catch {}
-      if (submitted) await sleep(1000);
-      await snap(page, `after_submit_${mark}`); // Frameはページ側で撮る
-    };
-
-    await trySubmitIn(page, 'main');
-    for (const frame of page.mainFrame().childFrames()) {
-      const tag = (frame.url().split('/').pop() || 'frame').slice(0, 40);
-      await trySubmitIn(frame, tag);
-    }
-
-    // 5) 最終保存
+    // 5) 仕上げ（最終の状態）
     await snap(page, 'final');
   } catch (e) {
     console.error(e);
