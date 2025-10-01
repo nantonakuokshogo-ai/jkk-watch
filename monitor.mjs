@@ -1,140 +1,242 @@
-// monitor.mjs  — Puppeteer専用（Playwrightメソッド不使用）
+// monitor.mjs  — JKK 検索フォームで「住宅名(カナ) = コーシャハイム」を入れて検索する安全版
 
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import puppeteer from 'puppeteer';
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import puppeteer from "puppeteer-core";
 
-const OUTDIR = 'out';
-const HEADLESS = true;               // 必要なら false に
-const NAV_TIMEOUT = 30000;           // 既定のナビ待ち
-const POPUP_TIMEOUT = 20000;         // ポップアップ検出待ち
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const OUT_DIR = path.join(__dirname, "out");
+const HEADLESS = true;
 
-async function ensureDir(dir) {
-  await fs.mkdir(dir, { recursive: true });
+// ★ ここを変えるだけで検索語を差し替えできます
+const KANA_KEYWORD = "コーシャハイム";
+
+// GitHub Actions の setup-chrome で入る実体
+const EXEC_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH ||
+  "google-chrome"; // ubuntu-latest では /usr/bin/google-chrome が解決されます
+
+// 便利関数
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ts = () =>
+  new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+
+function ensureOut() {
+  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 }
 
-async function save(page, key) {
-  const htmlPath = path.join(OUTDIR, `${key}.html`);
-  const pngPath  = path.join(OUTDIR, `${key}.png`);
-  try {
-    const html = await page.content();
-    await fs.writeFile(htmlPath, html, { encoding: 'utf8' });
-  } catch {}
-  try {
-    await page.screenshot({ path: pngPath, fullPage: true });
-  } catch {}
-  console.log(`[saved] ${key}`);
+async function savePage(page, label) {
+  ensureOut();
+  const base = `${label}_${ts()}`;
+  await page.screenshot({ path: path.join(OUT_DIR, `${base}.png`), fullPage: true });
+  const html = await page.content();
+  fs.writeFileSync(path.join(OUT_DIR, `${base}.html`), html, "utf8");
+  console.log(`[saved] ${label}`);
 }
 
-async function goto(page, url, key) {
+async function gotoSafe(page, url, waitUntil = "domcontentloaded", timeout = 30000) {
   console.log(`[goto] ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-  await save(page, key);
+  try {
+    await page.goto(url, { waitUntil, timeout });
+  } catch (e) {
+    console.warn(`[warn] goto failed (${url}): ${e.message}`);
+  }
+  await sleep(800); // 軽く安定化
 }
 
-function textIncludes(el, needle) {
-  return (el.textContent || '').trim().includes(needle);
-}
+// 「おわび」ページを検出したらトップへ戻る（穏やか復旧）
+async function recoverIfApology(page) {
+  const bodyText = await page.evaluate(() => document.body.innerText || "");
+  const isApology =
+    /おわび|ページが見つかりません|サーバーが大変混み合っております/i.test(bodyText);
+  if (!isApology) return false;
 
-/**
- * 「こちら」をクリックしてポップアップ（JKKnet）を捕捉。
- * - まず onload の自動処理に任せて少し待つ
- * - 出なければ明示的に「こちら」をクリック
- * - browser.waitForTarget(opener === current) で新しいタブ/ウィンドウを捕捉
- * - それでも出なければ、元ページのナビゲーション継続を採用
- */
-async function triggerRelayAndCatchPopup(browser, page) {
-  // 1) onload 自動実行の猶予
-  await page.waitForTimeout?.(600).catch(() => {}); // Puppeteerには waitForTimeout あり
-
-  // 2) まだポップアップが無ければ「こちら」をクリック
-  const beforeTargets = new Set(browser.targets());
+  // 「トップページへ戻る」らしき要素を片っ端から押す
   const clicked = await page.evaluate(() => {
-    const as = Array.from(document.querySelectorAll('a'));
-    const a = as.find(el => /こちら/.test((el.textContent || '').trim()));
-    if (a) { a.click(); return true; }
+    const cands = Array.from(
+      document.querySelectorAll('a, button, input[type="button"], input[type="submit"], area, [role="button"]')
+    );
+    for (const el of cands) {
+      const t = ((el.innerText || "") + " " + (el.value || "") + " " + (el.alt || "")).trim();
+      if (/トップページへ戻る|トップページ|戻る/i.test(t)) {
+        el.click();
+        return true;
+      }
+    }
     return false;
   });
   if (clicked) {
-    // クリック反映待ち
-    await page.waitForTimeout?.(200).catch(() => {});
+    await sleep(1500);
   }
-
-  // 3) 新規ターゲット（opener が現在の page）を待つ
-  let popupTarget = null;
-  try {
-    popupTarget = await browser.waitForTarget(
-      t => t.opener?.() === page.target() && !beforeTargets.has(t),
-      { timeout: POPUP_TIMEOUT }
-    );
-  } catch { /* timeout */ }
-
-  // 4) ポップアップが捕まったらその page を返す。無ければ現在の page を継続
-  if (popupTarget) {
-    const popupPage = await popupTarget.page();
-    try { await popupPage.bringToFront(); } catch {}
-    return popupPage;
-  }
-  return page;
+  return true;
 }
 
-async function main() {
-  await ensureDir(OUTDIR);
+// 指定した語を本文に含むフレームを見つける
+async function findFrameByText(page, regex) {
+  // 自身も含めてチェック
+  const check = async (frame) => {
+    try {
+      const ok = await frame.evaluate((reSource) => {
+        const re = new RegExp(reSource, "i");
+        return re.test(document.body.innerText || "");
+      }, regex.source);
+      return ok ? frame : null;
+    } catch {
+      return null;
+    }
+  };
 
+  const selfHit = await check(page.mainFrame());
+  if (selfHit) return selfHit;
+
+  for (const f of page.mainFrame().childFrames()) {
+    const hit = await check(f);
+    if (hit) return hit;
+  }
+  // さらに深い階層も探索
+  const q = [...page.frames()];
+  for (const f of q) {
+    const hit = await check(f);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// 住宅名(カナ) を入力して「検索する」を押す（フレーム渡し）
+async function fillKanaAndSearch(frame, keyword) {
+  // 1) 入力欄を見つける（ラベルに「住宅名」や「カナ」を含む行にあるテキストボックス）
+  const filled = await frame.evaluate((kw) => {
+    // ラベルの文字に依存しすぎないように、近傍のテキストを総当たりで判定
+    const textboxes = Array.from(
+      document.querySelectorAll('input[type="text"], input[type="search"]')
+    );
+
+    const normalize = (s) => (s || "").replace(/\s+/g, "");
+    const hasKanaLabelNear = (el) => {
+      let node = el;
+      // 祖先方向に最大 5 階層まで見て、近傍テキストを集約
+      let collected = "";
+      for (let i = 0; i < 5 && node; i++) {
+        const prev = node.previousElementSibling;
+        if (prev) collected += prev.textContent || "";
+        node = node.parentElement;
+      }
+      const txt = normalize(collected + " " + (el.getAttribute("title") || ""));
+      return /住宅名|カナ|（カナ）|\(カナ\)/.test(txt);
+    };
+
+    // ありがちな name 候補もついでに見る
+    const nameHints = /kana|jutakumei|jyutakumei|jname|house.*kana|mansion.*kana/i;
+
+    let target = null;
+    for (const el of textboxes) {
+      if (hasKanaLabelNear(el) || nameHints.test(el.name || "")) {
+        target = el;
+        break;
+      }
+    }
+    if (!target && textboxes.length === 1) target = textboxes[0]; // 最後の保険
+
+    if (!target) return { ok: false, reason: "input-not-found" };
+
+    target.focus();
+    target.value = kw;
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true };
+  }, keyword);
+
+  if (!filled.ok) throw new Error("Kana textbox not found");
+
+  // 2) 「検索する」らしきボタンを押す
+  const clicked = await frame.evaluate(() => {
+    const cands = Array.from(
+      document.querySelectorAll('button, input, a, area, [role="button"]')
+    );
+    // 優先: 「検索する」, 予備: 「検索」
+    const match = (el, re) => {
+      const t = ((el.innerText || "") + " " + (el.value || "") + " " + (el.alt || "")).trim();
+      return re.test(t);
+    };
+
+    let btn = cands.find((el) => match(el, /検索する/));
+    if (!btn) btn = cands.find((el) => match(el, /検索(?!方)/)); // 「検索方法」を除外したい
+
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+  if (!clicked) throw new Error("Search button not found");
+
+  // 送信後の待機（ナビゲーションでも Ajax でもどちらでも少し待つ）
+  await sleep(2500);
+}
+
+(async () => {
+  ensureOut();
 
   const browser = await puppeteer.launch({
-    headless: HEADLESS ? 'new' : false,
-    // GitHub Actions で安定させるおまじない
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-});
+    headless: HEADLESS,
+    executablePath: EXEC_PATH,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    protocolTimeout: 120000,
+  });
+
+  const page = await browser.newPage();
+  page.setDefaultTimeout(30000);
 
   try {
-    const page = await browser.newPage();
-    page.setDefaultTimeout(NAV_TIMEOUT);
-    page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+    // 入口まわり（おわびからの復帰も考慮）
+    const homes = [
+      "https://jhomes.to-kousya.or.jp/",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/index.html",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
+    ];
 
-    // ---- HOME 到達まで（エラーページでも保存） ----
-    await goto(page, 'https://jhomes.to-kousya.or.jp/',                  'home_1');
-    await save(page, 'home_1_after');
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/',    'home_2');
-    await save(page, 'home_2_after');
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/index.html', 'home_3');
-    await save(page, 'home_3_after');
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/service/',   'home_4');
-    await save(page, 'home_4_after');
+    for (let i = 0; i < homes.length; i++) {
+      await gotoSafe(page, homes[i]);
+      await savePage(page, `home_${i + 1}`);
+      await recoverIfApology(page);
+      await savePage(page, `home_${i + 1}_after`);
+    }
 
-    // ---- StartInit に直接入る（frameset入口）----
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit', 'frameset_startinit');
+    // 直接 StartInit へ
+    console.log("[frameset] direct goto StartInit with referer=/service/");
+    await gotoSafe(
+      page,
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+      "domcontentloaded",
+      45000
+    );
+    await savePage(page, "frameset_startinit");
 
-    // ここで onload の open + submit によりポップアップが出る可能性あり。
-    // 念のため「こちら」を明示クリックし、ポップアップ（または自身の遷移）を捕捉
-    await save(page, 'after_relay_1');
-    const active = await triggerRelayAndCatchPopup(browser, page);
+    // 検索フォームが出るフレームを特定（ページ内文言で探索）
+    // 候補: 「先着順あき家検索」「検索する」「住宅名」など
+    const targetFrame =
+      (await findFrameByText(page, /先着順.*あき家検索/)) ||
+      (await findFrameByText(page, /住宅名|検索する/));
 
-    // ポップアップ側（または自身）での遷移完了待ち
-    try {
-      await active.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: POPUP_TIMEOUT }).catch(() => {});
-      await active.waitForNetworkIdle?.({ idleTime: 800, timeout: 8000 }).catch(() => {});
-    } catch {}
+    if (!targetFrame) {
+      // メインフレームにチャットが重なってるケースもあるので、ひと呼吸
+      await savePage(page, "after_relay_1");
+      throw new Error("Search form frame not found");
+    }
 
-    await save(active, 'after_submit_main');
+    // 入力 → 検索
+    await fillKanaAndSearch(targetFrame, KANA_KEYWORD);
+    await savePage(page, "after_submit_main");
 
-    // 最終状態も保存（どちらが生きていても）
-    await save(active, 'final');
-
+    // 最終スナップ
+    await savePage(page, "final");
   } catch (err) {
     console.error(err);
-    // 失敗スナップショット（可能なら）
-    try {
-      const pages = await (await puppeteer.connect).browser?.pages?.() ?? [];
-      if (pages.length) await save(pages[0], 'final_error');
-    } catch {}
+    await savePage(page, "final_error");
     process.exitCode = 1;
   } finally {
-    // 少し余裕を持ってから閉じる（ログ収集などのため）
-    try { await new Promise(r => setTimeout(r, 300)); } catch {}
     await browser.close();
   }
-}
-
-main();
+})();
