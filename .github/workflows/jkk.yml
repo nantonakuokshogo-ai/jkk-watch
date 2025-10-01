@@ -1,3 +1,4 @@
+# .github/workflows/jkk.yml
 name: run
 on: { workflow_dispatch: {} }
 
@@ -11,39 +12,26 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"
-          cache: "npm"
+          node-version: "20.x"   # ← cache は指定しない
 
-      # Chrome を入れる
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      # 絶対パスを必ず解決して CHROME_PATH に入れる（ここがポイント）
       - name: Resolve Chrome path
         shell: bash
         run: |
           set -eo pipefail
           CHROME_BIN="${{ steps.chrome.outputs.chrome-path }}"
-          # outputs がコマンド名のケースに備えて command -v で絶対パスへ
           if [ -n "$CHROME_BIN" ] && [ ! -x "$CHROME_BIN" ]; then
             CHROME_BIN="$(command -v "$CHROME_BIN" || true)"
           fi
-          # 予備候補
-          if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
-            CHROME_BIN="$(command -v google-chrome || true)"
-          fi
-          if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
-            CHROME_BIN="$(command -v google-chrome-stable || true)"
-          fi
-          if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
-            CHROME_BIN="$(command -v chromium || true)"
-          fi
-          if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
-            CHROME_BIN="$(command -v chromium-browser || true)"
-          fi
+          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v google-chrome || true)"
+          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v google-chrome-stable || true)"
+          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v chromium || true)"
+          [ -z "$CHROME_BIN" ] && CHROME_BIN="$(command -v chromium-browser || true)"
           echo "Using CHROME_PATH=$CHROME_BIN"
           test -x "$CHROME_BIN"
           echo "CHROME_PATH=$CHROME_BIN" >> $GITHUB_ENV
