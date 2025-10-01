@@ -2,7 +2,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import puppeteer from 'puppeteer-core';
+import puppeteer from 'puppeteer';
 
 const OUTDIR = 'out';
 const HEADLESS = true;               // 必要なら false に
@@ -81,12 +81,12 @@ async function triggerRelayAndCatchPopup(browser, page) {
 async function main() {
   await ensureDir(OUTDIR);
 
-  // GitHub Actions などで Chrome が既に入っている想定
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || 'google-chrome';
+
   const browser = await puppeteer.launch({
     headless: HEADLESS ? 'new' : false,
-    executablePath
-  });
+    // GitHub Actions で安定させるおまじない
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+});
 
   try {
     const page = await browser.newPage();
