@@ -1,4 +1,4 @@
-// monitor.mjs ーーーコピペでそのまま置換OK
+// monitor.mjs ーーーコピペ置換OK
 
 import fs from "fs/promises";
 import path from "path";
@@ -14,7 +14,7 @@ const CHROME_BIN =
 // 住宅名(カナ) に入れる語
 const KANA_QUERY = "コーシャハイム";
 
-// ==== 小物ユーティリティ ====
+// ==== ユーティリティ ====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function ensureOut() {
@@ -25,10 +25,8 @@ function ts() {
   return new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 }
 
-// スクショ & HTML 保存（幅0エラー対策のため viewport を毎回確認）
 async function save(page, base) {
   await ensureOut();
-  // 念のため viewport を確実にセット
   const vp = page.viewport();
   if (!vp || !vp.width || !vp.height) {
     await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
@@ -41,7 +39,6 @@ async function save(page, base) {
   console.log(`[saved] ${base}`);
 }
 
-// 目視相当の「見えて押せる」判定
 function visibleScript() {
   return (el) => {
     if (!el) return false;
@@ -57,10 +54,9 @@ function visibleScript() {
   };
 }
 
-// 文字でクリック（a, button, input[type=button|submit]）
 async function clickByText(page, text) {
   const handle = await page.evaluateHandle((t, isVisible) => {
-    const visible = eval(isVisible); // 関数ソースを受け取って復元
+    const visible = eval(isVisible);
     const cands = [
       ...document.querySelectorAll(
         'a,button,input[type="button"],input[type="submit"]'
@@ -83,16 +79,13 @@ async function clickByText(page, text) {
   }
 }
 
-// 単純遷移＋安定化＋保存
 async function gotoAndSave(page, url, name) {
   console.log(`[goto] ${url}`);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-  // 若干待って描画安定
   await sleep(500);
   await save(page, name);
 }
 
-// 「おわび」「ページが見つかりません」「タイムアウト」等から復帰
 async function recoverIfApology(page) {
   const flag = await page.evaluate(() => {
     const t = document.body?.innerText || "";
@@ -101,7 +94,6 @@ async function recoverIfApology(page) {
   if (!flag) return false;
 
   console.log("[recover] apology -> back to top");
-  // 「トップページへ戻る」を押す
   const clicked =
     (await clickByText(page, "トップページへ戻る")) ||
     (await clickByText(page, "トップページへ")) ||
@@ -114,10 +106,8 @@ async function recoverIfApology(page) {
   return false;
 }
 
-// チャット/オーバーレイ等を隠す（検索ボタンが隠れるのを防ぐ）
 async function hideOverlays(page) {
   await page.evaluate(() => {
-    // 目立つチャット系を削除
     const killers = [
       'iframe[src*="mediatalk"]',
       'iframe[id*="media"]',
@@ -132,9 +122,11 @@ async function hideOverlays(page) {
   });
 }
 
-// 「住宅名(カナ)」入力欄を探して入力
+// === 強化版: 「住宅名(カナ)」入力 ＆ 検索実行 ===
 async function fillKanaAndSearch(page, text) {
-  // 入力欄を探す（ラベル近傍のinput）
+  // 作業前の状態を保存（診断用）
+  await save(page, "before_fill");
+
   const ok = await page.evaluate((val) => {
     const visible = (el) => {
       const cs = getComputedStyle(el);
@@ -146,44 +138,63 @@ async function fillKanaAndSearch(page, text) {
         r.height > 0
       );
     };
+    const hasKW = (node) => {
+      if (!node) return false;
+      const s = (node.textContent || "").replace(/\s+/g, "");
+      return /住宅|住宅名/.test(s) && /カナ|ｶﾅ|ヨミ|ﾖﾐ|ﾌﾘｶﾞﾅ|フリガナ/.test(s);
+    };
 
-    // 候補となるラベル要素群
-    const labelish = Array.from(
-      document.querySelectorAll("label,th,td,span,div")
-    ).filter((el) => /住宅名/.test(el.textContent || "") && /カナ/.test(el.textContent || ""));
-
-    // 近傍のinput[type=text]を探す
     let input = null;
-    for (const lab of labelish) {
-      const tr = lab.closest("tr");
-      if (tr) {
-        input = tr.querySelector('input[type="text"], input:not([type])');
-        if (input && visible(input)) break;
+    const allInputs = Array.from(
+      document.querySelectorAll('input[type="text"], input:not([type])')
+    ).filter(visible);
+
+    // A) ラベル/近傍探索
+    if (!input) {
+      for (const inp of allInputs) {
+        let node = inp;
+        let hit = false;
+        for (let i = 0; i < 4 && node; i++) {
+          const prev = node.previousElementSibling;
+          if (prev && hasKW(prev)) {
+            hit = true;
+            break;
+          }
+          node = node.parentElement;
+          if (node && hasKW(node)) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit) {
+          input = inp;
+          break;
+        }
       }
-      input = lab.querySelector('input[type="text"], input:not([type])');
-      if (input && visible(input)) break;
-      // 兄弟方向
-      input =
-        lab.nextElementSibling?.querySelector?.(
-          'input[type="text"], input:not([type])'
-        ) || null;
-      if (input && visible(input)) break;
     }
 
-    // 最後の手、placeholder などから推定
+    // B) 属性名から推測
     if (!input) {
-      input = Array.from(
-        document.querySelectorAll('input[type="text"], input:not([type])')
-      ).find((el) =>
-        /カナ|住宅|棟|住戸/.test(
-          (el.getAttribute("name") || "") +
-            (el.getAttribute("id") || "") +
-            (el.placeholder || "")
+      input = allInputs.find((el) =>
+        /(kana|yomi|kanaName|yomigana|kana\w*|yomi\w*|ｶﾅ|カナ)/i.test(
+          (el.name || "") + (el.id || "") + (el.placeholder || "")
         )
       );
     }
 
+    // C) 上部&幅広のテキスト入力（最後の保険）
+    if (!input && allInputs.length) {
+      allInputs.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        // 上にある & 幅が広い順
+        return ra.top - rb.top || rb.width - ra.width;
+      });
+      input = allInputs[0];
+    }
+
     if (!input) return false;
+
     input.focus();
     input.value = "";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
@@ -194,18 +205,24 @@ async function fillKanaAndSearch(page, text) {
 
   if (!ok) throw new Error("住宅名(カナ) の入力欄が見つかりませんでした。");
 
-  // 検索ボタンを押す（画面に2個あることが多いので最初の見えてる方）
   await hideOverlays(page);
+
+  // 検索ボタンへスクロールしてクリック
+  await page.evaluate(() => {
+    const btns = [...document.querySelectorAll('a,button,input[type="button"],input[type="submit"]')].filter(
+      (el) => /検索する|検索/.test((el.innerText || el.value || "").trim())
+    );
+    if (btns[0]) btns[0].scrollIntoView({ block: "center" });
+  });
+
   const clicked =
-    (await clickByText(page, "検索する")) ||
-    (await clickByText(page, "検索")) ||
-    (await clickByText(page, "けんさく"));
+    (await clickByText(page, "検索する")) || (await clickByText(page, "検索"));
   if (!clicked) throw new Error("検索ボタンが見つかりませんでした。");
-  // 遷移・描画安定待ち
-  await sleep(1500);
+
+  await sleep(2000);
 }
 
-// ==== メインフロー ====
+// ==== メイン ====
 async function main() {
   console.log(`[monitor] Using Chrome at: ${CHROME_BIN}`);
 
@@ -226,15 +243,12 @@ async function main() {
   await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
 
   try {
-    // 1) TOP → JKKねっとTOP へ
     await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/", "home_1");
     await save(page, "home_1_after");
 
-    // 2) JKKねっとトップ
     await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/search/jkknet/", "home_2");
     await save(page, "home_2_after");
 
-    // 3) index
     await gotoAndSave(
       page,
       "https://jhomes.to-kousya.or.jp/search/jkknet/index.html",
@@ -242,7 +256,6 @@ async function main() {
     );
     await save(page, "home_3_after");
 
-    // 4) service
     await gotoAndSave(
       page,
       "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
@@ -250,7 +263,6 @@ async function main() {
     );
     await save(page, "home_4_after");
 
-    // 5) frameset 起点へ
     console.log("[frameset] direct goto StartInit with referer=/service/");
     await gotoAndSave(
       page,
@@ -258,7 +270,6 @@ async function main() {
       "frameset_startinit"
     );
 
-    // おわび等で弾かれたら戻して再突入
     if (await recoverIfApology(page)) {
       await gotoAndSave(
         page,
@@ -274,15 +285,13 @@ async function main() {
       await save(page, "after_relay_1");
     }
 
-    // 6) 「住宅名(カナ)」へ入力 → 検索
     await hideOverlays(page);
     await fillKanaAndSearch(page, KANA_QUERY);
     await save(page, "after_submit_main");
 
-    // 7) 最終保存
     await save(page, "final");
   } catch (err) {
-    console.error(err);
+    console.error("Error:", err.message || err);
     try {
       await save(page, "final_error");
     } catch {}
