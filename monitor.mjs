@@ -1,242 +1,256 @@
-// monitor.mjs  — JKK 検索フォームで「住宅名(カナ) = コーシャハイム」を入れて検索する安全版
-
+// monitor.mjs  --- full paste OK ---
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-core";
+import { spawnSync } from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const OUT_DIR = path.join(__dirname, "out");
-const HEADLESS = true;
 
-// ★ ここを変えるだけで検索語を差し替えできます
-const KANA_KEYWORD = "コーシャハイム";
+// ========= 共通ユーティリティ =========
+const OUT = path.join(__dirname, "out");
+fs.mkdirSync(OUT, { recursive: true });
 
-// GitHub Actions の setup-chrome で入る実体
-const EXEC_PATH =
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  process.env.CHROME_PATH ||
-  "google-chrome"; // ubuntu-latest では /usr/bin/google-chrome が解決されます
-
-// 便利関数
+const log = (...a) => console.log(...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ts = () =>
-  new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
 
-function ensureOut() {
-  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
-}
-
-async function savePage(page, label) {
-  ensureOut();
-  const base = `${label}_${ts()}`;
-  await page.screenshot({ path: path.join(OUT_DIR, `${base}.png`), fullPage: true });
-  const html = await page.content();
-  fs.writeFileSync(path.join(OUT_DIR, `${base}.html`), html, "utf8");
-  console.log(`[saved] ${label}`);
-}
-
-async function gotoSafe(page, url, waitUntil = "domcontentloaded", timeout = 30000) {
-  console.log(`[goto] ${url}`);
+async function save(page, name) {
+  const png = path.join(OUT, `${name}.png`);
+  const html = path.join(OUT, `${name}.html`);
   try {
-    await page.goto(url, { waitUntil, timeout });
-  } catch (e) {
-    console.warn(`[warn] goto failed (${url}): ${e.message}`);
-  }
-  await sleep(800); // 軽く安定化
+    await page.screenshot({ path: png, fullPage: true });
+  } catch {}
+  try {
+    const c = await page.content();
+    fs.writeFileSync(html, c);
+  } catch {}
+  log("[saved]", name);
 }
 
-// 「おわび」ページを検出したらトップへ戻る（穏やか復旧）
-async function recoverIfApology(page) {
-  const bodyText = await page.evaluate(() => document.body.innerText || "");
-  const isApology =
-    /おわび|ページが見つかりません|サーバーが大変混み合っております/i.test(bodyText);
-  if (!isApology) return false;
-
-  // 「トップページへ戻る」らしき要素を片っ端から押す
-  const clicked = await page.evaluate(() => {
-    const cands = Array.from(
-      document.querySelectorAll('a, button, input[type="button"], input[type="submit"], area, [role="button"]')
-    );
-    for (const el of cands) {
-      const t = ((el.innerText || "") + " " + (el.value || "") + " " + (el.alt || "")).trim();
-      if (/トップページへ戻る|トップページ|戻る/i.test(t)) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  });
-  if (clicked) {
-    await sleep(1500);
+// ========= Chrome 実行ファイルの解決（A案のキモ） =========
+function which(cmd) {
+  try {
+    const r = spawnSync("which", [cmd], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : null;
+  } catch {
+    return null;
   }
-  return true;
 }
 
-// 指定した語を本文に含むフレームを見つける
-async function findFrameByText(page, regex) {
-  // 自身も含めてチェック
-  const check = async (frame) => {
+function resolveChromePath() {
+  const envs = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,            // ← setup-chrome がここに入る
+    process.env.GOOGLE_CHROME_BIN,
+    process.env.CHROMIUM_PATH,
+  ].filter(Boolean);
+
+  for (const p of envs) {
+    if (!p) continue;
     try {
-      const ok = await frame.evaluate((reSource) => {
-        const re = new RegExp(reSource, "i");
-        return re.test(document.body.innerText || "");
-      }, regex.source);
-      return ok ? frame : null;
-    } catch {
-      return null;
-    }
-  };
-
-  const selfHit = await check(page.mainFrame());
-  if (selfHit) return selfHit;
-
-  for (const f of page.mainFrame().childFrames()) {
-    const hit = await check(f);
-    if (hit) return hit;
+      if (fs.existsSync(p)) return p;
+    } catch {}
+    const w = which(p);
+    if (w) return w;
   }
-  // さらに深い階層も探索
-  const q = [...page.frames()];
-  for (const f of q) {
-    const hit = await check(f);
-    if (hit) return hit;
+
+  const candidates = [
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium-browser",
+    "chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+  ];
+  for (const c of candidates) {
+    const w = which(c);
+    if (w) return w;
   }
   return null;
 }
 
-// 住宅名(カナ) を入力して「検索する」を押す（フレーム渡し）
-async function fillKanaAndSearch(frame, keyword) {
-  // 1) 入力欄を見つける（ラベルに「住宅名」や「カナ」を含む行にあるテキストボックス）
-  const filled = await frame.evaluate((kw) => {
-    // ラベルの文字に依存しすぎないように、近傍のテキストを総当たりで判定
-    const textboxes = Array.from(
-      document.querySelectorAll('input[type="text"], input[type="search"]')
-    );
+const EXEC_PATH = resolveChromePath();
+if (!EXEC_PATH) {
+  console.error(
+    "Chrome/Chromium が見つかりません。workflow に setup-chrome を入れるか、CHROME_PATH を設定してください。"
+  );
+  process.exit(1);
+}
+log("[chrome]", EXEC_PATH);
 
-    const normalize = (s) => (s || "").replace(/\s+/g, "");
-    const hasKanaLabelNear = (el) => {
-      let node = el;
-      // 祖先方向に最大 5 階層まで見て、近傍テキストを集約
-      let collected = "";
-      for (let i = 0; i < 5 && node; i++) {
-        const prev = node.previousElementSibling;
-        if (prev) collected += prev.textContent || "";
-        node = node.parentElement;
-      }
-      const txt = normalize(collected + " " + (el.getAttribute("title") || ""));
-      return /住宅名|カナ|（カナ）|\(カナ\)/.test(txt);
-    };
-
-    // ありがちな name 候補もついでに見る
-    const nameHints = /kana|jutakumei|jyutakumei|jname|house.*kana|mansion.*kana/i;
-
-    let target = null;
-    for (const el of textboxes) {
-      if (hasKanaLabelNear(el) || nameHints.test(el.name || "")) {
-        target = el;
-        break;
-      }
-    }
-    if (!target && textboxes.length === 1) target = textboxes[0]; // 最後の保険
-
-    if (!target) return { ok: false, reason: "input-not-found" };
-
-    target.focus();
-    target.value = kw;
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-    target.dispatchEvent(new Event("change", { bubbles: true }));
-    return { ok: true };
-  }, keyword);
-
-  if (!filled.ok) throw new Error("Kana textbox not found");
-
-  // 2) 「検索する」らしきボタンを押す
-  const clicked = await frame.evaluate(() => {
-    const cands = Array.from(
-      document.querySelectorAll('button, input, a, area, [role="button"]')
-    );
-    // 優先: 「検索する」, 予備: 「検索」
-    const match = (el, re) => {
-      const t = ((el.innerText || "") + " " + (el.value || "") + " " + (el.alt || "")).trim();
-      return re.test(t);
-    };
-
-    let btn = cands.find((el) => match(el, /検索する/));
-    if (!btn) btn = cands.find((el) => match(el, /検索(?!方)/)); // 「検索方法」を除外したい
-
-    if (!btn) return false;
-    btn.click();
-    return true;
-  });
-  if (!clicked) throw new Error("Search button not found");
-
-  // 送信後の待機（ナビゲーションでも Ajax でもどちらでも少し待つ）
-  await sleep(2500);
+// ========= ページ操作ヘルパ =========
+async function goto(page, url, tag, wait = "domcontentloaded") {
+  log("[goto]", url);
+  await page.goto(url, { waitUntil: wait, timeout: 120000 });
+  await save(page, tag);
 }
 
-(async () => {
-  ensureOut();
+async function clickByText(page, text, tagAfter, { timeout = 12000 } = {}) {
+  const found = await page.evaluateHandle((t) => {
+    const xp = `.//*[normalize-space(text())='${t}']`;
+    const it = document.evaluate(
+      xp,
+      document,
+      null,
+      XPathResult.FIRST_ORDERED_NODE_TYPE,
+      null
+    );
+    return it.singleNodeValue;
+  }, text);
+  if (!found) return false;
 
+  try {
+    const box = await found.boundingBox?.();
+    if (!box) {
+      await page.evaluate((el) => el.click(), found);
+    } else {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    }
+    await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout });
+    if (tagAfter) await save(page, tagAfter);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function typeKanaIfExists(page, kana = "コーシャハイム") {
+  // 「住宅名(カナ)」に相当する入力をゆるく探索して入力
+  const ok = await page.evaluate((val) => {
+    function nearInputByText(sub) {
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT
+      );
+      const hits = [];
+      while (walker.nextNode()) {
+        const el = walker.currentNode;
+        const tx = el.textContent?.replace(/\s+/g, "");
+        if (!tx) continue;
+        if (tx.includes(sub)) hits.push(el);
+      }
+      for (const labelLike of hits) {
+        // 直後 or 祖先内の input を探す
+        const nextInput =
+          labelLike.querySelector?.("input[type='text']") ||
+          labelLike.parentElement?.querySelector?.("input[type='text']");
+        if (nextInput) return nextInput;
+        // 次兄弟
+        let sib = labelLike.nextElementSibling;
+        for (let i = 0; i < 3 && sib; i++, sib = sib.nextElementSibling) {
+          const inp = sib.querySelector?.("input[type='text']") || (sib.tagName === "INPUT" ? sib : null);
+          if (inp) return inp;
+        }
+      }
+      return null;
+    }
+
+    // 候補語
+    const cand = ["住宅名(カナ)", "住宅名（カナ）", "住宅名ｶﾅ", "カナ", "ｶﾅ"];
+    let input = null;
+    for (const c of cand) {
+      input = nearInputByText(c);
+      if (input) break;
+    }
+    if (!input) {
+      // name/id/placeholder に kana っぽい物があれば使う
+      const all = [...document.querySelectorAll("input[type='text']")];
+      input = all.find((i) =>
+        /(kana|ｶﾅ)/i.test(i.name || "") ||
+        /(kana|ｶﾅ)/i.test(i.id || "") ||
+        /(ｶﾅ|カナ)/.test(i.placeholder || "")
+      ) || null;
+    }
+    if (!input) return false;
+    input.focus();
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.value = val;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }, kana);
+
+  return ok;
+}
+
+async function clickSearchIfExists(page) {
+  const clicked = await page.evaluate(() => {
+    // 「検索する」ボタン（input[type=submit], button）の文字で探す
+    const labels = ["検索する", "検索", "検索開始"];
+    const btns = [
+      ...document.querySelectorAll("input[type='submit'],button")
+    ];
+    const hit = btns.find((b) => labels.includes(b.value) || labels.includes(b.textContent?.trim()));
+    if (!hit) return false;
+    hit.click();
+    return true;
+  });
+  if (!clicked) return false;
+  try {
+    await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20000 });
+  } catch {}
+  return true;
+}
+
+// ========= メイン =========
+async function main() {
   const browser = await puppeteer.launch({
-    headless: HEADLESS,
+    headless: true,
     executablePath: EXEC_PATH,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
-    protocolTimeout: 120000,
+    protocolTimeout: 120000
   });
 
   const page = await browser.newPage();
-  page.setDefaultTimeout(30000);
+  page.setDefaultTimeout(45000);
 
   try {
-    // 入口まわり（おわびからの復帰も考慮）
-    const homes = [
-      "https://jhomes.to-kousya.or.jp/",
-      "https://jhomes.to-kousya.or.jp/search/jkknet/",
-      "https://jhomes.to-kousya.or.jp/search/jkknet/index.html",
-      "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
-    ];
+    // 1) HOME から順に救済しながら進む
+    await goto(page, "https://jhomes.to-kousya.or.jp/", "home_1");
+    await save(page, "home_1_after");
 
-    for (let i = 0; i < homes.length; i++) {
-      await gotoSafe(page, homes[i]);
-      await savePage(page, `home_${i + 1}`);
-      await recoverIfApology(page);
-      await savePage(page, `home_${i + 1}_after`);
-    }
+    await goto(page, "https://jhomes.to-kousya.or.jp/search/jkknet/", "home_2");
+    await save(page, "home_2_after");
 
-    // 直接 StartInit へ
-    console.log("[frameset] direct goto StartInit with referer=/service/");
-    await gotoSafe(
+    await goto(page, "https://jhomes.to-kousya.or.jp/search/jkknet/index.html", "home_3");
+    await save(page, "home_3_after");
+
+    await goto(page, "https://jhomes.to-kousya.or.jp/search/jkknet/service/", "home_4");
+    await save(page, "home_4_after");
+
+    // frameset 直リンク
+    log("[frameset] direct goto StartInit with referer=/service/");
+    await goto(
       page,
       "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
-      "domcontentloaded",
-      45000
+      "frameset_startinit"
     );
-    await savePage(page, "frameset_startinit");
 
-    // 検索フォームが出るフレームを特定（ページ内文言で探索）
-    // 候補: 「先着順あき家検索」「検索する」「住宅名」など
-    const targetFrame =
-      (await findFrameByText(page, /先着順.*あき家検索/)) ||
-      (await findFrameByText(page, /住宅名|検索する/));
-
-    if (!targetFrame) {
-      // メインフレームにチャットが重なってるケースもあるので、ひと呼吸
-      await savePage(page, "after_relay_1");
-      throw new Error("Search form frame not found");
+    // 「こちら」救済（自動遷移しない時のリンク）
+    for (let i = 1; i <= 5; i++) {
+      const ok = await clickByText(page, "こちら", `after_relay_${i}`, { timeout: 15000 });
+      if (!ok) break;
+      await sleep(600);
     }
 
-    // 入力 → 検索
-    await fillKanaAndSearch(targetFrame, KANA_KEYWORD);
-    await savePage(page, "after_submit_main");
+    // 検索フォーム到達想定：カナ入力トライ
+    const kanaTyped = await typeKanaIfExists(page, "コーシャハイム");
+    if (kanaTyped) await save(page, "kana_filled");
 
-    // 最終スナップ
-    await savePage(page, "final");
-  } catch (err) {
-    console.error(err);
-    await savePage(page, "final_error");
+    const searched = await clickSearchIfExists(page);
+    if (searched) await save(page, "after_submit_main");
+
+    await save(page, "final");
+  } catch (e) {
+    console.error(e);
+    await save(page, "final_error");
     process.exitCode = 1;
   } finally {
     await browser.close();
   }
-})();
+}
+
+main();
