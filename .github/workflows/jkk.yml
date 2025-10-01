@@ -1,19 +1,7 @@
-name: run
+name: jkk.yml
 
 on:
   workflow_dispatch:
-    inputs:
-      kana:
-        description: "住宅名(カナ) に入れる文字"
-        required: false
-        default: "コーシャハイム"
-  # 必要ならスケジュールも（UTC）
-  # schedule:
-  #   - cron: "15 0 * * *"  # 毎日09:15(JST)
-
-concurrency:
-  group: jkk-monitor
-  cancel-in-progress: true
 
 jobs:
   monitor:
@@ -23,44 +11,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          # cache: npm  ← lockfileが無いと失敗するので使わない
+          node-version: '20'
 
       - name: Install Google Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gnupg
-          wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          google-chrome --version
-
-      - name: Install deps (puppeteer-core)
-        run: |
-          if [ ! -f package.json ]; then
-            npm init -y
+          sudo apt-get install -y google-chrome-stable || true
+          if ! command -v google-chrome >/dev/null; then
+            sudo apt-get install -y google-chrome || true
           fi
-          npm i puppeteer-core
+          which google-chrome || true
+          google-chrome --version || true
+
+      - name: Install deps (puppeteer-core only)
+        run: |
+          npm i --no-audit --no-fund puppeteer-core@22
 
       - name: Run monitor
-        run: node monitor.mjs
         env:
           CHROME_PATH: /usr/bin/google-chrome
-          JKK_KANA: ${{ github.event.inputs.kana || 'コーシャハイム' }}
+        run: node monitor.mjs
 
-  - name: Upload artifacts
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: jkk-watch
-    path: |
-      out/**
-      ./*.html
-      ./*.png
-      ./*.json
+      - name: Upload artifacts (out/)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out
+          path: out/**
           if-no-files-found: warn
-          retention-days: 7
