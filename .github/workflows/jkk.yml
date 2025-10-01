@@ -1,33 +1,47 @@
 name: run
 
 on:
-  workflow_dispatch: {}
-  push:
-    paths:
-      - "monitor.mjs"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/jkk.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: jkk-watch
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
+      # ❶ lockfile が無ければ自動で作る（repo に無くてもOK）
+      - name: Ensure lockfile
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "package-lock.json が無いので生成します"
+            npm i --package-lock-only --no-audit --no-fund
+          fi
+
+      # ❷ 依存インストール（lockfile ありで確実・再現性高め）
       - name: Install deps
         run: npm ci --no-audit --no-fund
 
+      # ❸ 実行
       - name: Run monitor
         run: node monitor.mjs
 
+      # ❹ 出力を回収（無くても警告に留める）
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
           path: out/**
+          if-no-files-found: warn
