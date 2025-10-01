@@ -1,11 +1,11 @@
 name: run
+
 on:
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -14,12 +14,24 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: "20.x"
+          cache: "npm"
+
+      # ★ ここで Chrome をインストール
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # ★ Puppeteer に渡すために CHROME_PATH を環境変数へ
+      - name: Export CHROME_PATH for Node
+        run: echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Run monitor
+      - name: Run
         run: node monitor.mjs
 
       - name: Upload artifacts
@@ -28,4 +40,3 @@ jobs:
         with:
           name: out
           path: out/**
-          if-no-files-found: warn
