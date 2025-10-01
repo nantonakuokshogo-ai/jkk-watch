@@ -1,227 +1,296 @@
-// monitor.mjs
-// Puppeteer Core + system Chrome を使用して JKK 先着順あき家検索へ到達し、
-// 「住宅名(カナ)」に『コーシャハイム』を入れて検索まで実行。
-// 生成物: out/ 以下に PNG と HTML を保存。
+// monitor.mjs ーーーコピペでそのまま置換OK
 
-import fs from 'fs';
-import path from 'path';
-import puppeteer from 'puppeteer-core';
+import fs from "fs/promises";
+import path from "path";
+import puppeteer from "puppeteer-core";
 
-const OUT_DIR = 'out';
-const KANA = process.env.KANA || 'コーシャハイム';
+// ==== 設定 ====
+const OUT_DIR = "out";
+const CHROME_BIN =
+  process.env.GOOGLE_CHROME_BINARY ||
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  "/usr/bin/google-chrome";
 
-// GitHub Actions 上で入れている Chrome の既定パス
-const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+// 住宅名(カナ) に入れる語
+const KANA_QUERY = "コーシャハイム";
 
-// 失敗しても最後まで進めたいのでヘッドレス true 推奨（false でも動きます）
-const HEADLESS = process.env.HEADLESS === 'false' ? false : true;
+// ==== 小物ユーティリティ ====
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function log(...args) { console.log(...args); }
-
-async function ensureOutDir() {
-  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+async function ensureOut() {
+  await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
-async function save(page, name) {
+function ts() {
+  return new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
+}
+
+// スクショ & HTML 保存（幅0エラー対策のため viewport を毎回確認）
+async function save(page, base) {
+  await ensureOut();
+  // 念のため viewport を確実にセット
+  const vp = page.viewport();
+  if (!vp || !vp.width || !vp.height) {
+    await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
+    await sleep(100);
+  }
+  const png = path.join(OUT_DIR, `${base}.png`);
+  const html = path.join(OUT_DIR, `${base}.html`);
+  await fs.writeFile(html, await page.content());
+  await page.screenshot({ path: png, fullPage: true });
+  console.log(`[saved] ${base}`);
+}
+
+// 目視相当の「見えて押せる」判定
+function visibleScript() {
+  return (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return (
+      style &&
+      style.visibility !== "hidden" &&
+      style.display !== "none" &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+  };
+}
+
+// 文字でクリック（a, button, input[type=button|submit]）
+async function clickByText(page, text) {
+  const handle = await page.evaluateHandle((t, isVisible) => {
+    const visible = eval(isVisible); // 関数ソースを受け取って復元
+    const cands = [
+      ...document.querySelectorAll(
+        'a,button,input[type="button"],input[type="submit"]'
+      ),
+    ].filter(
+      (el) =>
+        visible(el) &&
+        ((el.innerText && el.innerText.includes(t)) ||
+          (el.value && el.value.includes(t)))
+    );
+    return cands[0] || null;
+  }, text, visibleScript.toString());
+
+  if (!handle) return false;
   try {
-    const png = path.join(OUT_DIR, `${name}.png`);
-    const html = path.join(OUT_DIR, `${name}.html`);
-    // 念のため viewport を毎回保証（0 width 回避）
-    await page.setViewport({ width: 1280, height: 2000, deviceScaleFactor: 1 });
-    await page.screenshot({ path: png, fullPage: true });
-    await fs.promises.writeFile(html, await page.content(), 'utf8');
-    log(`[saved] ${name}`);
-  } catch (e) {
-    log(`[warn] save failed at ${name}:`, e?.message || e);
+    await handle.click();
+    return true;
+  } finally {
+    await handle.dispose();
   }
 }
 
-async function goto(page, url, { referer } = {}) {
-  log(`[goto] ${url}`);
-  await page.goto(url, {
-    waitUntil: ['load', 'domcontentloaded'],
-    referer,
-    timeout: 60000,
+// 単純遷移＋安定化＋保存
+async function gotoAndSave(page, url, name) {
+  console.log(`[goto] ${url}`);
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  // 若干待って描画安定
+  await sleep(500);
+  await save(page, name);
+}
+
+// 「おわび」「ページが見つかりません」「タイムアウト」等から復帰
+async function recoverIfApology(page) {
+  const flag = await page.evaluate(() => {
+    const t = document.body?.innerText || "";
+    return /おわび|ページが見つかりません|タイムアウト|トップページへ戻る/.test(t);
   });
+  if (!flag) return false;
+
+  console.log("[recover] apology -> back to top");
+  // 「トップページへ戻る」を押す
+  const clicked =
+    (await clickByText(page, "トップページへ戻る")) ||
+    (await clickByText(page, "トップページへ")) ||
+    (await clickByText(page, "トップページ"));
+  if (clicked) {
+    await sleep(1200);
+    await save(page, `home_${ts()}`);
+    return true;
+  }
+  return false;
 }
 
-async function clickByText(page, selector, text) {
-  // page.$x は v22 で無くなったので、evaluate でテキスト一致要素を探す
-  return page.evaluate(
-    ({ selector, text }) => {
-      const nodes = Array.from(document.querySelectorAll(selector));
-      const target = nodes.find((n) => (n.textContent || '').includes(text));
-      if (target) {
-        target.scrollIntoView({ block: 'center', inline: 'center' });
-        (target instanceof HTMLAnchorElement || target instanceof HTMLButtonElement)
-          ? target.click()
-          : target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        return true;
-      }
-      return false;
-    },
-    { selector, text }
-  );
-}
-
-async function waitForNewPage(browser, timeoutMs = 12000) {
-  return new Promise((resolve) => {
-    let done = false;
-    const timer = setTimeout(() => {
-      if (!done) {
-        done = true;
-        resolve(null);
-      }
-    }, timeoutMs);
-    browser.once('targetcreated', async (t) => {
-      try {
-        const p = await t.page();
-        if (!done) {
-          done = true;
-          clearTimeout(timer);
-          resolve(p);
-        }
-      } catch {
-        if (!done) {
-          done = true;
-          clearTimeout(timer);
-          resolve(null);
-        }
-      }
-    });
-  });
-}
-
-async function fillKanaAndSubmit(page, kanaText) {
-  // 検索フォーム出現を待機
-  await page.waitForSelector('form[name="akiSearch"]', { timeout: 20000 });
-  // 入力名は公式スクリプト上これ（全角カナ/40文字のバリデーションあり）
-  // akiSearch の中にある input[name="akiyaInitRM.akiyaRefM.jyutakuKanaName"]
-  await page.evaluate((kana) => {
-    const form = document.forms['akiSearch'];
-    if (!form) return;
-    const inp = form.querySelector('input[name="akiyaInitRM.akiyaRefM.jyutakuKanaName"]');
-    if (inp) {
-      inp.focus();
-      inp.value = '';
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-      inp.value = kana;
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-  }, kanaText);
-
-  // 送信：ページ内の submitPage('akiyaInitFromJyouken') を使う
-  // これが無ければ form.submit() にフォールバック
+// チャット/オーバーレイ等を隠す（検索ボタンが隠れるのを防ぐ）
+async function hideOverlays(page) {
   await page.evaluate(() => {
-    // 二重クリックフラグを使っている実装のため軽く対策
-    try { window.dblclickFlg = false; } catch {}
-    if (typeof window.submitPage === 'function') {
-      // 条件検索からの送信アクション
-      window.submitPage('akiyaInitFromJyouken');
-    } else {
-      const f = document.forms['akiSearch'];
-      if (f) f.submit();
-    }
+    // 目立つチャット系を削除
+    const killers = [
+      'iframe[src*="mediatalk"]',
+      'iframe[id*="media"]',
+      ".mtm-app",
+      '[id*="MediaTalk"]',
+      '[class*="MediaTalk"]',
+      '[style*="z-index: 2147483647"]',
+    ];
+    killers.forEach((sel) =>
+      document.querySelectorAll(sel).forEach((el) => el.remove())
+    );
   });
 }
 
-async function main() {
-  await ensureOutDir();
+// 「住宅名(カナ)」入力欄を探して入力
+async function fillKanaAndSearch(page, text) {
+  // 入力欄を探す（ラベル近傍のinput）
+  const ok = await page.evaluate((val) => {
+    const visible = (el) => {
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return (
+        cs.display !== "none" &&
+        cs.visibility !== "hidden" &&
+        r.width > 0 &&
+        r.height > 0
+      );
+    };
 
-  if (!fs.existsSync(CHROME_PATH)) {
-    throw new Error(`Chrome not found at ${CHROME_PATH}`);
-  }
+    // 候補となるラベル要素群
+    const labelish = Array.from(
+      document.querySelectorAll("label,th,td,span,div")
+    ).filter((el) => /住宅名/.test(el.textContent || "") && /カナ/.test(el.textContent || ""));
+
+    // 近傍のinput[type=text]を探す
+    let input = null;
+    for (const lab of labelish) {
+      const tr = lab.closest("tr");
+      if (tr) {
+        input = tr.querySelector('input[type="text"], input:not([type])');
+        if (input && visible(input)) break;
+      }
+      input = lab.querySelector('input[type="text"], input:not([type])');
+      if (input && visible(input)) break;
+      // 兄弟方向
+      input =
+        lab.nextElementSibling?.querySelector?.(
+          'input[type="text"], input:not([type])'
+        ) || null;
+      if (input && visible(input)) break;
+    }
+
+    // 最後の手、placeholder などから推定
+    if (!input) {
+      input = Array.from(
+        document.querySelectorAll('input[type="text"], input:not([type])')
+      ).find((el) =>
+        /カナ|住宅|棟|住戸/.test(
+          (el.getAttribute("name") || "") +
+            (el.getAttribute("id") || "") +
+            (el.placeholder || "")
+        )
+      );
+    }
+
+    if (!input) return false;
+    input.focus();
+    input.value = "";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    input.value = val;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return true;
+  }, text);
+
+  if (!ok) throw new Error("住宅名(カナ) の入力欄が見つかりませんでした。");
+
+  // 検索ボタンを押す（画面に2個あることが多いので最初の見えてる方）
+  await hideOverlays(page);
+  const clicked =
+    (await clickByText(page, "検索する")) ||
+    (await clickByText(page, "検索")) ||
+    (await clickByText(page, "けんさく"));
+  if (!clicked) throw new Error("検索ボタンが見つかりませんでした。");
+  // 遷移・描画安定待ち
+  await sleep(1500);
+}
+
+// ==== メインフロー ====
+async function main() {
+  console.log(`[monitor] Using Chrome at: ${CHROME_BIN}`);
 
   const browser = await puppeteer.launch({
-    headless: HEADLESS,
-    executablePath: CHROME_PATH,
+    executablePath: CHROME_BIN,
+    headless: "new",
+    defaultViewport: { width: 1366, height: 2400, deviceScaleFactor: 1 },
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--lang=ja-JP',
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--lang=ja-JP",
+      "--window-size=1366,2400",
     ],
-    defaultViewport: { width: 1280, height: 2000, deviceScaleFactor: 1 },
   });
 
-  let page = await browser.newPage();
-  log('[monitor] Using Chrome at:', CHROME_PATH);
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
 
   try {
-    // 入口を順に辿る（保存は “*_after” で DOM 安定後）
-    await goto(page, 'https://jhomes.to-kousya.or.jp/');
-    await save(page, 'home_1');
-    await page.waitForTimeout(500);
-    await save(page, 'home_1_after');
+    // 1) TOP → JKKねっとTOP へ
+    await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/", "home_1");
+    await save(page, "home_1_after");
 
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/');
-    await save(page, 'home_2');
-    await page.waitForTimeout(300);
-    await save(page, 'home_2_after');
+    // 2) JKKねっとトップ
+    await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/search/jkknet/", "home_2");
+    await save(page, "home_2_after");
 
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/index.html');
-    await save(page, 'home_3');
-    await page.waitForTimeout(300);
-    await save(page, 'home_3_after');
-
-    await goto(page, 'https://jhomes.to-kousya.or.jp/search/jkknet/service/');
-    await save(page, 'home_4');
-    await page.waitForTimeout(300);
-    await save(page, 'home_4_after');
-
-    // StartInit へ（ここで別ウィンドウ/タブが開くことがある）
-    const newPagePromise = waitForNewPage(browser, 15000);
-    await goto(
+    // 3) index
+    await gotoAndSave(
       page,
-      'https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit',
-      { referer: 'https://jhomes.to-kousya.or.jp/search/jkknet/service/' }
+      "https://jhomes.to-kousya.or.jp/search/jkknet/index.html",
+      "home_3"
     );
-    await save(page, 'frameset_startinit');
+    await save(page, "home_3_after");
 
-    const popped = await newPagePromise;
-    if (popped) {
-      page = popped;
-      await page.bringToFront();
+    // 4) service
+    await gotoAndSave(
+      page,
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
+      "home_4"
+    );
+    await save(page, "home_4_after");
+
+    // 5) frameset 起点へ
+    console.log("[frameset] direct goto StartInit with referer=/service/");
+    await gotoAndSave(
+      page,
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+      "frameset_startinit"
+    );
+
+    // おわび等で弾かれたら戻して再突入
+    if (await recoverIfApology(page)) {
+      await gotoAndSave(
+        page,
+        "https://jhomes.to-kousya.or.jp/search/jkknet/",
+        `home_${ts()}`
+      );
+      await gotoAndSave(
+        page,
+        "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+        "after_relay_1"
+      );
     } else {
-      // ページ内に「こちら」リンクが出るパターンへの保険
-      await clickByText(page, 'a', 'こちら');
-      const popped2 = await waitForNewPage(browser, 8000);
-      if (popped2) {
-        page = popped2;
-        await page.bringToFront();
-      }
+      await save(page, "after_relay_1");
     }
 
-    // メイン検索画面（先着順あき家検索）に来たら保存
-    await page.waitForSelector('form[name="akiSearch"]', { timeout: 20000 });
-    await save(page, `after_relay_1`);
+    // 6) 「住宅名(カナ)」へ入力 → 検索
+    await hideOverlays(page);
+    await fillKanaAndSearch(page, KANA_QUERY);
+    await save(page, "after_submit_main");
 
-    // ★ ここで「住宅名(カナ)」= コーシャハイム を投入して検索
-    await fillKanaAndSubmit(page, KANA);
-
-    // 遷移待ち（同一タブ遷移/別タブ遷移どちらにも対応）
-    const maybeNew = await waitForNewPage(browser, 15000);
-    if (maybeNew) {
-      page = maybeNew;
-      await page.bringToFront();
-    } else {
-      try {
-        await page.waitForNavigation({ timeout: 15000, waitUntil: 'load' });
-      } catch { /* そのまま続行 */ }
-    }
-
-    // 検索後の画面を保存
-    await save(page, 'after_submit_main');
-
-    // 最終スクショ（エラーページでも見えるように）
-    await save(page, 'final');
-  } catch (e) {
-    log('[error]', e?.stack || e?.message || e);
-    await save(page, 'final_error');
-    process.exitCode = 1;
-  } finally {
+    // 7) 最終保存
+    await save(page, "final");
+  } catch (err) {
+    console.error(err);
+    try {
+      await save(page, "final_error");
+    } catch {}
     await browser.close();
+    process.exit(1);
   }
+
+  await browser.close();
 }
 
 main();
