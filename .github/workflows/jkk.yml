@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: '20'
 
-      # ❶ lockfile が無ければ自動で作る（repo に無くてもOK）
+      # lockfile が無ければここで作る
       - name: Ensure lockfile
         run: |
           if [ ! -f package-lock.json ]; then
@@ -29,15 +29,29 @@ jobs:
             npm i --package-lock-only --no-audit --no-fund
           fi
 
-      # ❷ 依存インストール（lockfile ありで確実・再現性高め）
       - name: Install deps
         run: npm ci --no-audit --no-fund
 
-      # ❸ 実行
-      - name: Run monitor
-        run: node monitor.mjs
+      # monitor.mjs / monitor.js のどちらかを自動検出
+      - name: Pick entry script
+        run: |
+          set -e
+          if [ -f monitor.mjs ]; then
+            echo "ENTRY=monitor.mjs" >> $GITHUB_ENV
+            echo "Found monitor.mjs"
+          elif [ -f monitor.js ]; then
+            echo "ENTRY=monitor.js" >> $GITHUB_ENV
+            echo "Found monitor.js"
+          else
+            echo "✗ monitor.mjs / monitor.js が見つかりません。カレント:"
+            pwd
+            ls -la
+            exit 1
+          fi
 
-      # ❹ 出力を回収（無くても警告に留める）
+      - name: Run monitor
+        run: node "$ENTRY"
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
