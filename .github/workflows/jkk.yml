@@ -49,9 +49,12 @@ jobs:
       - name: Install deps
         run: npm i --no-audit --no-fund
 
-      - name: Run monitor
-        run: node monitor.mjs
-
+    - name: Run monitor
+      run: node monitor.mjs
+      env:
+        CHROME_PATH: /usr/bin/google-chrome
+        JKK_KANA: コーシャハイム
+        
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
