@@ -1,10 +1,12 @@
 name: jkk.yml
+
 on:
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,27 +17,28 @@ jobs:
           node-version: 20
 
       - name: Install Google Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /etc/apt/keyrings/google.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
 
-      # lockfile が無くても毎回クリーンに入るように
       - name: Install deps
         run: |
-          rm -f package-lock.json
-          npm init -y >/dev/null 2>&1 || true
-          # レガシー互換を保つため puppeteer-core は 10 以上ならOK。固定で22入れるが古いAPIは使わない。
-          npm i puppeteer-core@22
+          npm ci || npm i
 
-      - name: Run monitor.mjs
+      - name: Run monitor
         env:
-          PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
+          GOOGLE_CHROME: /usr/bin/google-chrome
         run: node monitor.mjs
 
-      - name: Upload out/**
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: out
+          name: jkk-out
           path: out/**
           if-no-files-found: warn
+          retention-days: 7
