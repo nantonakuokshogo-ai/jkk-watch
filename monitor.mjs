@@ -1,305 +1,338 @@
-// monitor.mjs ーーーコピペ置換OK
+// monitor.mjs  — ESM / Puppeteer-core v22+ 対応版
+// - $x / waitForTimeout を使わない
+// - 中継(wait.jsp → StartInit)の挙動にフォールバック
+// - 「住宅名(カナ)」を高耐性で特定して「コーシャハイム」を入力
+// - 「検索する」をクリックして結果を保存
 
-import fs from "fs/promises";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import puppeteer from "puppeteer-core";
 
-// ==== 設定 ====
-const OUT_DIR = "out";
-const CHROME_BIN =
-  process.env.GOOGLE_CHROME_BINARY ||
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  "/usr/bin/google-chrome";
+const OUTDIR = "out";
+const BASE = "https://jhomes.to-kousya.or.jp";
+const KANA_KEYWORD = "コーシャハイム";
 
-// 住宅名(カナ) に入れる語
-const KANA_QUERY = "コーシャハイム";
-
-// ==== ユーティリティ ====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function ensureOut() {
-  await fs.mkdir(OUT_DIR, { recursive: true });
+function log(...args) {
+  console.log(...args);
 }
 
-function ts() {
-  return new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
+function ensureOut() {
+  fs.mkdirSync(OUTDIR, { recursive: true });
 }
 
-async function save(page, base) {
-  await ensureOut();
-  const vp = page.viewport();
-  if (!vp || !vp.width || !vp.height) {
-    await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
-    await sleep(100);
-  }
-  const png = path.join(OUT_DIR, `${base}.png`);
-  const html = path.join(OUT_DIR, `${base}.html`);
-  await fs.writeFile(html, await page.content());
-  await page.screenshot({ path: png, fullPage: true });
-  console.log(`[saved] ${base}`);
-}
-
-function visibleScript() {
-  return (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return (
-      style &&
-      style.visibility !== "hidden" &&
-      style.display !== "none" &&
-      rect.width > 0 &&
-      rect.height > 0
-    );
-  };
-}
-
-async function clickByText(page, text) {
-  const handle = await page.evaluateHandle((t, isVisible) => {
-    const visible = eval(isVisible);
-    const cands = [
-      ...document.querySelectorAll(
-        'a,button,input[type="button"],input[type="submit"]'
-      ),
-    ].filter(
-      (el) =>
-        visible(el) &&
-        ((el.innerText && el.innerText.includes(t)) ||
-          (el.value && el.value.includes(t)))
-    );
-    return cands[0] || null;
-  }, text, visibleScript.toString());
-
-  if (!handle) return false;
+async function save(page, name) {
+  ensureOut();
+  const safe = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const png = path.join(OUTDIR, `${safe}.png`);
+  const html = path.join(OUTDIR, `${safe}.html`);
   try {
-    await handle.click();
-    return true;
-  } finally {
-    await handle.dispose();
+    const content = await page.content();
+    fs.writeFileSync(html, content, "utf8");
+  } catch {}
+  try {
+    await page.screenshot({ path: png, fullPage: true });
+    log(`[saved] ${safe}`);
+  } catch (e) {
+    log(`[warn] screenshot failed for ${safe}: ${e.message}`);
   }
 }
 
-async function gotoAndSave(page, url, name) {
-  console.log(`[goto] ${url}`);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await sleep(500);
+async function goto(page, url, name) {
+  log("[goto]", url.replace(BASE, ""));
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  // ビューポート未設定だと 0x0 になりスクショ失敗することがある
+  await page.setViewport({ width: 1200, height: 2200, deviceScaleFactor: 1 });
+  // ネットワークの静穏を軽く待つ
+  await sleep(800);
   await save(page, name);
 }
 
-async function recoverIfApology(page) {
-  const flag = await page.evaluate(() => {
-    const t = document.body?.innerText || "";
-    return /おわび|ページが見つかりません|タイムアウト|トップページへ戻る/.test(t);
+async function hideObstacles(page) {
+  // チャット/フローティング類が被ることがあるので隠す
+  await page.addStyleTag({
+    content: `
+      #bot-container, #bot, .mediatalk-widget, [id*="MediaTalk"], iframe[src*="mediatalk"] { display:none !important; }
+      .fixed, .sticky, [style*="position: fixed"] { z-index: 1 !important; }
+    `,
   });
-  if (!flag) return false;
+}
 
-  console.log("[recover] apology -> back to top");
-  const clicked =
-    (await clickByText(page, "トップページへ戻る")) ||
-    (await clickByText(page, "トップページへ")) ||
-    (await clickByText(page, "トップページ"));
-  if (clicked) {
-    await sleep(1200);
-    await save(page, `home_${ts()}`);
-    return true;
+async function forceForwardOnStartInit(page) {
+  // frameset_startinit のフォールバック: submitNext() or form.submit()
+  await page.evaluate(() => {
+    try {
+      if (typeof submitNext === "function") submitNext();
+    } catch {}
+    try {
+      const f = document.forms?.forwardForm;
+      if (f && typeof f.submit === "function") f.submit();
+    } catch {}
+  });
+}
+
+function pickChromePath() {
+  // Actions の Ubuntu ランナーでは /usr/bin/google-chrome が入っているはず
+  const cands = [
+    process.env.GOOGLE_CHROME_BIN,
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/opt/google/chrome/google-chrome",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ].filter(Boolean);
+  for (const p of cands) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+  return undefined;
+}
+
+// 目視テキストで「住宅名(カナ)」欄を推定して返す（なければ null）
+async function findKanaInput(handleRoot) {
+  return await handleRoot.evaluateHandle(() => {
+    const isVisible = (el) => {
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return (
+        r.width > 0 &&
+        r.height > 0 &&
+        st.visibility !== "hidden" &&
+        st.display !== "none"
+      );
+    };
+
+    // 候補: テキスト入力すべて
+    const inputs = Array.from(
+      document.querySelectorAll('input[type="text"], input:not([type]), textarea')
+    ).filter(isVisible);
+
+    // スコアリング: 近傍の文言や属性に「住宅名」「カナ」が含まれるほど高得点
+    const scoreOf = (el) => {
+      let score = 0;
+      const attrs =
+        (el.name || "") +
+        " " +
+        (el.id || "") +
+        " " +
+        (el.getAttribute("title") || "") +
+        " " +
+        (el.getAttribute("placeholder") || "");
+      if (/kana|ｶﾅ/i.test(attrs)) score += 3;
+      if (/jutaku|jyutaku|jtk|ju?tak(u)?|住宅名/i.test(attrs)) score += 3;
+
+      const near = (node) => (node ? node.textContent || "" : "");
+      const box = el.closest("td,th,div,li,section,fieldset,form") || document.body;
+      const text = (near(box) + " " + near(box.previousElementSibling))
+        .replace(/\s+/g, "");
+      if (text.includes("住宅名")) score += 4;
+      if (text.includes("カナ") || text.includes("（カナ）") || text.includes("ｶﾅ")) score += 4;
+
+      // テーブルの行見出しセルにヒントがあるケース
+      const row = el.closest("tr");
+      if (row) {
+        const head = row.querySelector("th,td");
+        if (head) {
+          const t = head.textContent.replace(/\s+/g, "");
+          if (t.includes("住宅名")) score += 2;
+          if (t.includes("カナ") || t.includes("ｶﾅ")) score += 2;
+        }
+      }
+      return score;
+    };
+
+    let best = null;
+    let bestScore = -1;
+    for (const el of inputs) {
+      const s = scoreOf(el);
+      if (s > bestScore) {
+        best = el;
+        bestScore = s;
+      }
+    }
+    return best;
+  });
+}
+
+async function typeKanaInto(pageOrFrame, text) {
+  // トップ→各 frame の順に探索して最初に見つかった入力にタイプする
+  const roots = [pageOrFrame, ...pageOrFrame.frames?.() ?? []];
+
+  for (const root of roots) {
+    try {
+      const handleRoot = "evaluate" in root ? root : root.page(); // Page or Frame
+      const targetHandle = await findKanaInput(handleRoot);
+      const isNull = await targetHandle.evaluate((n) => n == null);
+      if (isNull) continue;
+
+      await hideObstacles("page" in root ? root : await root.page?.());
+      await (("bringToFront" in root && root.bringToFront) ? root.bringToFront() : null);
+
+      // 入力
+      const ok = await targetHandle.evaluate((el, value) => {
+        el.focus();
+        // 既存値クリア
+        if ("value" in el) el.value = "";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        // 入力
+        if ("value" in el) el.value = value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        return true;
+      }, text);
+
+      if (ok) return true;
+    } catch (e) {
+      // 次の root へ
+    }
   }
   return false;
 }
 
-async function hideOverlays(page) {
-  await page.evaluate(() => {
-    const killers = [
-      'iframe[src*="mediatalk"]',
-      'iframe[id*="media"]',
-      ".mtm-app",
-      '[id*="MediaTalk"]',
-      '[class*="MediaTalk"]',
-      '[style*="z-index: 2147483647"]',
-    ];
-    killers.forEach((sel) =>
-      document.querySelectorAll(sel).forEach((el) => el.remove())
-    );
-  });
-}
-
-// === 強化版: 「住宅名(カナ)」入力 ＆ 検索実行 ===
-async function fillKanaAndSearch(page, text) {
-  // 作業前の状態を保存（診断用）
-  await save(page, "before_fill");
-
-  const ok = await page.evaluate((val) => {
-    const visible = (el) => {
-      const cs = getComputedStyle(el);
+async function clickSearch(page) {
+  // 「検索する」ボタンを可視要素から探してクリック
+  const clickedTop = await page.evaluate(() => {
+    const isVisible = (el) => {
+      const st = window.getComputedStyle(el);
       const r = el.getBoundingClientRect();
       return (
-        cs.display !== "none" &&
-        cs.visibility !== "hidden" &&
         r.width > 0 &&
-        r.height > 0
+        r.height > 0 &&
+        st.visibility !== "hidden" &&
+        st.display !== "none"
       );
     };
-    const hasKW = (node) => {
-      if (!node) return false;
-      const s = (node.textContent || "").replace(/\s+/g, "");
-      return /住宅|住宅名/.test(s) && /カナ|ｶﾅ|ヨミ|ﾖﾐ|ﾌﾘｶﾞﾅ|フリガナ/.test(s);
-    };
+    const els = Array.from(
+      document.querySelectorAll('button, input[type="submit"], input[type="button"], a')
+    ).filter(isVisible);
 
-    let input = null;
-    const allInputs = Array.from(
-      document.querySelectorAll('input[type="text"], input:not([type])')
-    ).filter(visible);
-
-    // A) ラベル/近傍探索
-    if (!input) {
-      for (const inp of allInputs) {
-        let node = inp;
-        let hit = false;
-        for (let i = 0; i < 4 && node; i++) {
-          const prev = node.previousElementSibling;
-          if (prev && hasKW(prev)) {
-            hit = true;
-            break;
-          }
-          node = node.parentElement;
-          if (node && hasKW(node)) {
-            hit = true;
-            break;
-          }
-        }
-        if (hit) {
-          input = inp;
-          break;
-        }
-      }
-    }
-
-    // B) 属性名から推測
-    if (!input) {
-      input = allInputs.find((el) =>
-        /(kana|yomi|kanaName|yomigana|kana\w*|yomi\w*|ｶﾅ|カナ)/i.test(
-          (el.name || "") + (el.id || "") + (el.placeholder || "")
-        )
-      );
-    }
-
-    // C) 上部&幅広のテキスト入力（最後の保険）
-    if (!input && allInputs.length) {
-      allInputs.sort((a, b) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
-        // 上にある & 幅が広い順
-        return ra.top - rb.top || rb.width - ra.width;
-      });
-      input = allInputs[0];
-    }
-
-    if (!input) return false;
-
-    input.focus();
-    input.value = "";
-    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    input.value = val;
-    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    return true;
-  }, text);
-
-  if (!ok) throw new Error("住宅名(カナ) の入力欄が見つかりませんでした。");
-
-  await hideOverlays(page);
-
-  // 検索ボタンへスクロールしてクリック
-  await page.evaluate(() => {
-    const btns = [...document.querySelectorAll('a,button,input[type="button"],input[type="submit"]')].filter(
-      (el) => /検索する|検索/.test((el.innerText || el.value || "").trim())
+    const match = els.find(
+      (el) =>
+        /検索する/.test(el.textContent || "") ||
+        /検索する/.test(el.getAttribute("value") || "")
     );
-    if (btns[0]) btns[0].scrollIntoView({ block: "center" });
+    if (match) {
+      match.click();
+      return true;
+    }
+    return false;
   });
+  if (clickedTop) return true;
 
-  const clicked =
-    (await clickByText(page, "検索する")) || (await clickByText(page, "検索"));
-  if (!clicked) throw new Error("検索ボタンが見つかりませんでした。");
-
-  await sleep(2000);
+  // frame 内も探索
+  for (const f of page.frames()) {
+    try {
+      const clicked = await f.evaluate(() => {
+        const isVisible = (el) => {
+          const st = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return (
+            r.width > 0 &&
+            r.height > 0 &&
+            st.visibility !== "hidden" &&
+            st.display !== "none"
+          );
+        };
+        const els = Array.from(
+          document.querySelectorAll('button, input[type="submit"], input[type="button"], a')
+        ).filter(isVisible);
+        const match = els.find(
+          (el) =>
+            /検索する/.test(el.textContent || "") ||
+            /検索する/.test(el.getAttribute("value") || "")
+        );
+        if (match) {
+          match.click();
+          return true;
+        }
+        return false;
+      });
+      if (clicked) return true;
+    } catch {}
+  }
+  return false;
 }
 
-// ==== メイン ====
 async function main() {
-  console.log(`[monitor] Using Chrome at: ${CHROME_BIN}`);
+  const executablePath = pickChromePath();
+  console.log("[monitor] Using Chrome at:", executablePath || "(auto)");
 
   const browser = await puppeteer.launch({
-    executablePath: CHROME_BIN,
     headless: "new",
-    defaultViewport: { width: 1366, height: 2400, deviceScaleFactor: 1 },
+    executablePath,
     args: [
       "--no-sandbox",
-      "--disable-setuid-sandbox",
       "--disable-gpu",
-      "--lang=ja-JP",
-      "--window-size=1366,2400",
+      "--disable-dev-shm-usage",
+      "--window-size=1200,2200",
     ],
+    defaultViewport: { width: 1200, height: 2200 },
   });
 
   const page = await browser.newPage();
-  await page.setViewport({ width: 1366, height: 2400, deviceScaleFactor: 1 });
+  await page.setUserAgent(
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36"
+  );
+  page.setDefaultTimeout(60_000);
 
   try {
-    await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/", "home_1");
+    // 1) トップ → jkknet 入口 → index → service
+    await goto(page, `${BASE}/`, "home_1");
     await save(page, "home_1_after");
 
-    await gotoAndSave(page, "https://jhomes.to-kousya.or.jp/search/jkknet/", "home_2");
+    await goto(page, `${BASE}/search/jkknet/`, "home_2");
     await save(page, "home_2_after");
 
-    await gotoAndSave(
-      page,
-      "https://jhomes.to-kousya.or.jp/search/jkknet/index.html",
-      "home_3"
-    );
+    await goto(page, `${BASE}/search/jkknet/index.html`, "home_3");
     await save(page, "home_3_after");
 
-    await gotoAndSave(
-      page,
-      "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
-      "home_4"
-    );
+    await goto(page, `${BASE}/search/jkknet/service/`, "home_4");
     await save(page, "home_4_after");
 
-    console.log("[frameset] direct goto StartInit with referer=/service/");
-    await gotoAndSave(
+    // 2) 中継ページ（frameset_startinit 相当）へ直接
+    log("[frameset] direct goto StartInit with referer=/service/");
+    await goto(
       page,
-      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+      `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`,
       "frameset_startinit"
     );
 
-    if (await recoverIfApology(page)) {
-      await gotoAndSave(
-        page,
-        "https://jhomes.to-kousya.or.jp/search/jkknet/",
-        `home_${ts()}`
-      );
-      await gotoAndSave(
-        page,
-        "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
-        "after_relay_1"
-      );
-    } else {
-      await save(page, "after_relay_1");
+    // 自動遷移が止まることがあるのでフォース
+    await forceForwardOnStartInit(page);
+    await sleep(1200);
+
+    // ここで本体画面が出てくる想定
+    await hideObstacles(page);
+    await save(page, "after_relay_1");
+
+    // 3) 「住宅名(カナ)」に "コーシャハイム" を入力
+    await save(page, "before_fill");
+    const filled = await typeKanaInto(page, KANA_KEYWORD);
+    if (!filled) {
+      throw new Error("住宅名(カナ) の入力欄が見つかりませんでした。");
     }
 
-    await hideOverlays(page);
-    await fillKanaAndSearch(page, KANA_QUERY);
+    // 4) 「検索する」をクリック
+    const clicked = await clickSearch(page);
+    if (!clicked) {
+      throw new Error("「検索する」ボタンを見つけられませんでした。");
+    }
+
+    // 遷移待ち & 保存
+    await sleep(1500);
+    await hideObstacles(page);
     await save(page, "after_submit_main");
 
+    // 念のため最終も保存
     await save(page, "final");
   } catch (err) {
     console.error("Error:", err.message || err);
-    try {
-      await save(page, "final_error");
-    } catch {}
+    await save(page, "final_error");
+    throw err;
+  } finally {
     await browser.close();
-    process.exit(1);
   }
-
-  await browser.close();
 }
 
-main();
+main().catch(() => process.exit(1));
