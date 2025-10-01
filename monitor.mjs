@@ -1,4 +1,4 @@
-// monitor.mjs — ESM / Puppeteer v23+ 安定版
+// monitor.mjs — Puppeteer v23+ 安定・ナビゲーション待ち強化版
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +8,7 @@ import puppeteer from 'puppeteer';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== 設定 =====
+// ========= 設定 =========
 const OUT_DIR = path.join(__dirname, 'out');
 const BASE = 'https://jhomes.to-kousya.or.jp';
 const TRY_URLS = [
@@ -19,9 +19,14 @@ const TRY_URLS = [
 ];
 const START_INIT = `${BASE}/search/jkknet/service/akiyaJyoukenStartInit`;
 
-// ===== 共通ユーティリティ =====
+// 待ちの設定（必要ならここを上げる）
+const NAV_TIMEOUT = 12_000;     // クリック後の短いナビ待ち
+const PAGE_TIMEOUT = 60_000;    // page のタイムアウト
+const PROTOCOL_TIMEOUT = 120_000; // CDP プロトコルのタイムアウト
+
+// ========= ユーティリティ =========
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ensureDir = (dir) => { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); };
+const ensureDir = (d) => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); };
 
 async function snap(page, name) {
   ensureDir(OUT_DIR);
@@ -32,88 +37,101 @@ async function snap(page, name) {
 
 async function goto(page, url, name) {
   console.log(`[goto] ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await sleep(800);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+  await sleep(700);
   await snap(page, name);
 }
 
-// --- Puppeteer v23+ 互換：テキスト一致でクリック（$x 非依存）
-async function clickByText(pageOrFrame, text) {
-  const clicked = await pageOrFrame.evaluate((txt) => {
-    const candidates = [
+// クリック → 短いナビ待ち（遷移しない場合は待ちを無視）
+async function clickByTextWithNav(page, text) {
+  const before = page.url();
+  const clicked = await page.evaluate((txt) => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const nodes = [
       ...document.querySelectorAll('a,button,input[type="submit"],input[type="button"]'),
     ];
-    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    for (const el of candidates) {
+    for (const el of nodes) {
       const label = norm(el.innerText || el.value || el.getAttribute('aria-label') || '');
-      if (label.includes(txt)) {
-        el.click();
-        return true;
-      }
+      if (label.includes(txt)) { el.click(); return true; }
     }
     return false;
   }, text);
-  if (clicked) await sleep(600);
-  return clicked;
+
+  if (!clicked) return false;
+
+  // 短いナビ待ち（遷移しない場合は握り潰す）
+  try {
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }),
+      page.waitForURL((u) => u !== before, { timeout: NAV_TIMEOUT }),
+    ]);
+  } catch {} // 遷移しなければOK
+  await sleep(600);
+  return true;
 }
 
 async function recoverApology(page) {
   const body = await page.evaluate(() => document.body.innerText || '');
   if (/おわび|エラー|ページが見つかりません|タイムアウト/i.test(body)) {
-    const ok = await clickByText(page, 'トップページへ戻る');
+    const ok = await clickByTextWithNav(page, 'トップページへ戻る');
     if (ok) { await sleep(800); return true; }
   }
   return false;
 }
 
-// ===== メイン =====
+// submit 後に軽く待つ（フレームでもOK）。ナビ有無は問わない。
+async function submitFormIn(ctx) {
+  const did = await ctx.evaluate(() => {
+    const f = document.querySelector('form');
+    if (f) { f.submit(); return true; }
+    return false;
+  });
+  if (did) await sleep(1000);
+  return did;
+}
+
 async function main() {
   ensureDir(OUT_DIR);
 
   const browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    protocolTimeout: PROTOCOL_TIMEOUT,                    // ★ 追加
     defaultViewport: { width: 1280, height: 800 },
   });
   const page = await browser.newPage();
+  page.setDefaultTimeout(PAGE_TIMEOUT);                   // ★ 追加
+  page.setDefaultNavigationTimeout(PAGE_TIMEOUT);         // ★ 追加
 
   try {
-    // 1) HOME 周りを順にトライ
+    // 1) HOME 4 通りトライ
     for (let i = 0; i < TRY_URLS.length; i++) {
       await goto(page, TRY_URLS[i], `home_${i + 1}`);
       await recoverApology(page);
       await snap(page, `home_${i + 1}_after`);
     }
 
-    // 2) frameset を飛ばして StartInit へ
+    // 2) frameset を飛ばして StartInit
     console.log('[frameset] direct goto StartInit with referer=/service/');
     await page.setExtraHTTPHeaders({ referer: `${BASE}/search/jkknet/service/` });
     await goto(page, START_INIT, 'frameset_startinit');
 
-    // 3) 「こちら」を最大4回まで踏む（あれば）
+    // 3) 「こちら」を最大 4 回試す（クリック → 短いナビ待ち）
     for (let t = 1; t <= 4; t++) {
-      const clicked = await clickByText(page, 'こちら');
+      const clicked = await clickByTextWithNav(page, 'こちら');
       await snap(page, `after_relay_${t}`);
       if (!clicked) break;
     }
 
-    // 4) form submit（本体と子フレーム）
-    const trySubmitIn = async (ctx, mark) => {
-      const submitted = await ctx.evaluate(() => {
-        const f = document.querySelector('form');
-        if (f) { f.submit(); return true; }
-        return false;
-      });
-      if (submitted) await sleep(800);
-      // スクショは常に page で撮る（Frameは screenshot を持たないため）
-      await snap(page, `after_submit_${mark}`);
-    };
+    // 4) submit（main と子フレーム）。直後に小休止しつつ Page 側で撮影
+    if (await submitFormIn(page)) await sleep(600);
+    await snap(page, 'after_submit_main');
 
-    await trySubmitIn(page, 'main');
-
-    // 子フレームにも submit を試行
     for (const frame of page.mainFrame().childFrames()) {
-      await trySubmitIn(frame, (frame.url().split('/').pop() || 'frame'));
+      if (await submitFormIn(frame)) await sleep(600);
+      // Frame は screenshot 不可 → Page 側で保存
+      const tag = (frame.url().split('/').pop() || 'frame').slice(0, 40);
+      await snap(page, `after_submit_${tag}`);
     }
 
     // 5) 最終保存
