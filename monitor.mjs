@@ -1,4 +1,4 @@
-// monitor.mjs — JKK 先着順あき家検索：ポップアップ封じ（window.open 同一タブ化）＋全フレーム探索
+// monitor.mjs — フォーム入力は一旦スキップして、一覧(50件表示)に直行して文字ヒットを検出する版
 import puppeteer from 'puppeteer-core';
 import fs from 'fs/promises';
 import path from 'path';
@@ -7,10 +7,9 @@ const BASE = 'https://jhomes.to-kousya.or.jp';
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 const VIEW = { width: 1280, height: 1800, deviceScaleFactor: 1 };
 const OUT  = '.';
-const KANA_WORD = process.env.KANA || 'コーシャハイム';
 
-function norm(s=''){return String(s).replace(/[\s\u3000\r\n\t]+/g,'').replace(/[()（）［］\[\]【】<＞<>:：・*＊]/g,'');}
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+// ここを狙いのキーワードに変える（全角/半角どっちも見る）
+const KEYWORD = process.env.KANA || 'コーシャハイム';
 
 async function ensureViewport(page){
   await page.setViewport(VIEW);
@@ -29,17 +28,6 @@ async function save(page, name){
     console.log(`[save skipped] ${name}: ${e.message}`);
   }
 }
-async function saveFrame(page, frame, name){
-  try{
-    await ensureViewport(page);
-    const html = await frame.evaluate(()=>document.documentElement.outerHTML);
-    await fs.writeFile(path.join(OUT, `${name}.html`), html, 'utf8');
-    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
-    console.log(`[saved] ${name}`);
-  }catch(e){
-    console.log(`[save frame skipped] ${name}: ${e.message}`);
-  }
-}
 
 async function goto(page, url, referer){
   const abs = url.startsWith('http') ? url : BASE+url;
@@ -49,98 +37,13 @@ async function goto(page, url, referer){
   await page.goto(abs, opts);
 }
 
-async function clickTextIn(frameOrPage, text){
-  const ok = await frameOrPage.evaluate((t)=>{
-    const N=s=>String(s||'').replace(/\s+/g,'');
-    const els=[...document.querySelectorAll('a,button,input[type="submit"],input[type="button"],input[type="image"]')];
-    const el = els.find(e=> N(e.value||e.textContent||e.getAttribute('alt')||'').includes(N(t)));
-    if (el){ (el instanceof HTMLElement) && el.click(); return true; }
-    return false;
-  }, text);
-  return ok;
+function hasApology(html){
+  return /JKKねっと：おわび/.test(html) || /おわび/.test(html);
 }
 
-async function dumpAllFrames(p, tag){
-  const fsList = p.frames();
-  console.log(`[frames] ${tag} count=${fsList.length}`);
-  let i=0;
-  for (const f of fsList){
-    let head=''; try{head = await f.evaluate(()=> (document.body?.innerText||'').slice(0,120));}catch{}
-    console.log(`[frame#${i}] url=${f.url()} head=${head.replace(/\n/g,' ')}`);
-    await saveFrame(p, f, `frames_dump_${tag}_${i}`);
-    i++;
-  }
-}
-
-async function pickSearchFrame(page){
-  // 「検索」ボタンやテキスト入力があるフレームを優先
-  const frames = page.frames();
-  for (const f of frames){
-    const score = await f.evaluate(()=>{
-      const hasBtn  = !!document.querySelector('input[type="submit"],input[type="button"],input[type="image"],button,a');
-      const hasText = !!document.querySelector('input[type="text"],input:not([type]),input[type="search"]');
-      const body    = (document.body && document.body.innerText) || '';
-      const hint    = /先着順|検索|住宅名|カナ/.test(body);
-      return (hasBtn?1:0) + (hasText?1:0) + (hint?1:0);
-    }).catch(()=>0);
-    if (score>=2) return f;
-  }
-  return null;
-}
-
-async function pickKanaSelectorInFrame(frame){
-  const sel = await frame.evaluate(()=>{
-    const N=(s)=>String(s||'').replace(/[\s\u3000\r\n\t]+/g,'').replace(/[()（）［］\[\]【】<＞<>:：・*＊]/g,'');
-    const isKanaLabel = (t)=>{ const n=N(t); return n.includes('住宅名カナ') || (n.includes('住宅名')&&n.includes('カナ')); };
-
-    // 1) label[for]
-    for (const lab of Array.from(document.querySelectorAll('label'))){
-      if (isKanaLabel(lab.textContent||'')){
-        const id = lab.getAttribute('for');
-        if (id) return `#${CSS.escape(id)}`;
-      }
-    }
-    // 2) 表の同一行
-    for (const cell of Array.from(document.querySelectorAll('td,th'))){
-      if (isKanaLabel(cell.textContent||'')){
-        const tr = cell.closest('tr');
-        if (tr){
-          const cand = tr.querySelector('input[type="text"],input:not([type]),input[type="search"]');
-          if (cand){
-            if (cand.id) return `#${CSS.escape(cand.id)}`;
-            if (cand.name) return `[name="${cand.name}"]`;
-            return 'input[type="text"],input:not([type]),input[type="search"]';
-          }
-        }
-      }
-    }
-    // 3) フォールバック（name/aria-label/title にカナ）
-    const fb = Array.from(document.querySelectorAll('input[type="text"],input:not([type]),input[type="search"]'))
-      .find(el=> /カナ|kana|ｶﾅ/i.test([el.name, el.id, el.title, el.getAttribute('aria-label')].join('')));
-    if (fb){
-      if (fb.id) return `#${CSS.escape(fb.id)}`;
-      if (fb.name) return `[name="${fb.name}"]`;
-      return 'input[type="text"],input:not([type]),input[type="search"]';
-    }
-    return null;
-  });
-  return sel;
-}
-
-async function clickSearchInFrame(frame){
-  const clicked = await frame.evaluate(()=>{
-    const N=s=>String(s||'').replace(/\s+/g,'');
-    const btns=[...document.querySelectorAll('input[type="submit"],input[type="button"],input[type="image"],button,a')];
-    const byText = btns.find(b=>{
-      const t=N(b.value||b.textContent||b.getAttribute('alt')||'');
-      return t.includes('検索する') || t.includes('検索');
-    });
-    if (byText){ (byText instanceof HTMLElement) && byText.click(); return true; }
-    const f = document.querySelector('form[action*="Jyouken"]') || document.querySelector('form');
-    if (f){ f.submit(); return true; }
-    return false;
-  });
-  return clicked;
+function includesKeyword(text, kw){
+  const half = kw.replace(/コ/g,'ｺ').replace(/ー/g,'ｰ').replace(/シャ/g,'ｼｬ').replace(/ハ/g,'ﾊ').replace(/イ/g,'ｲ').replace(/ム/g,'ﾑ'); // 超雑な半角化
+  return text.includes(kw) || text.includes(half);
 }
 
 async function main(){
@@ -159,87 +62,38 @@ async function main(){
     const page = await browser.newPage();
     await ensureViewport(page);
 
-    // ★ Puppeteer では addInitScript ではなく evaluateOnNewDocument を使う
-    await page.evaluateOnNewDocument(() => {
-      const origOpen = window.open;
-      // StartInit や wait.jsp が window.open を使っても“同一タブ遷移”にする
-      window.open = function(url){ try{ location.href = url; }catch(e){} return window; };
-      // 念のため target=_blank のリンクも同一タブに
-      document.addEventListener('click', (e) => {
-        const a = e.target && (e.target.closest && e.target.closest('a[target="_blank"]'));
-        if (a) { e.preventDefault(); location.href = a.href; }
-      }, true);
-    });
-
-    // 入口を正しい順序で辿る（Referer 重要）
+    // 入口を正しく踏んで Cookie/Referer を整える
     await goto(page, '/');                             await save(page, 'home_1');
     await goto(page, '/search/jkknet/');              await save(page, 'home_1_after');
     await goto(page, '/search/jkknet/index.html');    await save(page, 'home_2');
     await goto(page, '/search/jkknet/service/');      await save(page, 'home_2_after');
 
-    // StartInit（ここで wait.jsp → 本体フォームへ）
-    console.log('[frameset] direct goto StartInit with referer=/service/');
+    // StartInit まで踏む（セッションを厳格にするため）
     await goto(page, '/search/jkknet/service/akiyaJyoukenStartInit', '/search/jkknet/service/');
     await save(page, 'frameset_startinit');
 
-    // 「こちら」クリック → submitNext() → wait.jsp 直遷移 の順に総当たり
-    await clickTextIn(page, 'こちら');
-    await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 12000}).catch(()=>{});
+    // ★ 一覧ページを直接開く（50件表示）
+    const listPath = '/search/jkknet/service/AKIYAchangeCount?condRecNum=50';
+    await goto(page, listPath, '/search/jkknet/service/akiyaJyoukenStartInit');
+    await save(page, 'list_50');
 
-    if ((await page.content()).includes('自動で次の画面') || page.url().includes('akiyaJyoukenStartInit')){
-      await page.evaluate(()=>{ try{ if (typeof submitNext==='function') submitNext(); }catch(e){} });
-      await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 10000}).catch(()=>{});
-    }
-    if ((await page.content()).includes('自動で次の画面') || page.url().includes('akiyaJyoukenStartInit')){
-      await goto(page, '/search/jkknet/wait.jsp', '/search/jkknet/service/akiyaJyoukenStartInit');
-    }
-
-    // wait.jsp 側で forwardForm があれば送信
-    await page.evaluate(()=>{
-      try{
-        const f = (document.forms && (document.forms.forwardForm || document.forms[0])) || document.querySelector('form');
-        f && f.submit();
-      }catch(e){}
-    });
-    await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 15000}).catch(()=>{});
-    await save(page, 'before_fill');
-
-    // ここからは「同一タブ」で本体フォームを探索
-    await dumpAllFrames(page, 'before');
-    let sFrame = await pickSearchFrame(page);
-    if (!sFrame){
-      // mainFrame 直載りの可能性も見る
-      sFrame = page.mainFrame();
+    const html = await page.content();
+    if (hasApology(html)) {
+      console.log('[list] got apology page — refererやセッションの通し方がまだ足りない可能性');
+      // 追加の足場：service/に戻ってからもう一回
+      await goto(page, '/search/jkknet/service/', '/search/jkknet/index.html');
+      await goto(page, '/search/jkknet/service/AKIYAchangeCount?condRecNum=50', '/search/jkknet/service/');
+      await save(page, 'list_50_retry');
     }
 
-    // 「住宅名(カナ)」の入力欄を特定
-    const sel = await pickKanaSelectorInFrame(sFrame);
-    console.log('[pick] kana selector =', sel);
-    if (!sel){
-      await saveFrame(page, sFrame, 'final_error');
-      throw new Error('住宅名(カナ) の入力欄が見つかりませんでした。');
+    // 画面テキストでキーワード検出（まずはページ1だけ）
+    const text = await page.evaluate(()=>document.body ? document.body.innerText : '');
+    const hit = includesKeyword(text, KEYWORD);
+    console.log(`[detect] keyword="${KEYWORD}" hit=${hit}`);
+
+    if (!hit) {
+      console.log('[note] 1ページ目(50件)にヒットなし。複数ページがある場合は次へを辿る実装に拡張可能。');
     }
-
-    // 入力
-    await sFrame.focus(sel).catch(()=>{});
-    await sFrame.evaluate((sel)=>{
-      const el = document.querySelector(sel);
-      if (el){ el.value=''; el.dispatchEvent(new Event('input',{bubbles:true})); }
-    }, sel);
-    await sFrame.type(sel, KANA_WORD, { delay: 10 });
-
-    // 検索実行
-    const clicked = await clickSearchInFrame(sFrame);
-    if (!clicked){
-      await sFrame.evaluate(()=>{
-        const f = document.querySelector('form[action*="Jyouken"]') || document.querySelector('form');
-        f && f.submit();
-      });
-    }
-
-    await page.waitForNavigation({waitUntil:'domcontentloaded', timeout: 20000}).catch(()=>{});
-    await dumpAllFrames(page, 'after');
-    await save(page, 'final');
 
   }catch(err){
     console.error('Error:', err.message || err);
