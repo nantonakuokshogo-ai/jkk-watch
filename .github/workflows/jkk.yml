@@ -18,6 +18,7 @@ jobs:
 
       - name: Install Google Chrome
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y wget gnupg
           wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | \
@@ -26,7 +27,24 @@ jobs:
             sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
-          google-chrome --version
+          google-chrome-stable --version || true
+          command -v google-chrome || true
+          command -v google-chrome-stable || true
+          ls -l /usr/bin/google-chrome* || true
+
+      - name: Discover Chrome path (export to env)
+        run: |
+          set -eux
+          BIN="$(command -v google-chrome || true)"
+          if [ -z "$BIN" ]; then
+            BIN="$(command -v google-chrome-stable || true)"
+          fi
+          if [ -z "$BIN" ]; then
+            echo "Chrome binary not found on PATH" >&2
+            exit 1
+          fi
+          echo "Found Chrome at: $BIN"
+          echo "PUPPETEER_EXECUTABLE_PATH=$BIN" >> $GITHUB_ENV
 
       - name: Install deps
         run: npm i --no-audit --no-fund
