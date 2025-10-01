@@ -1,16 +1,11 @@
 name: run
-
 on:
   workflow_dispatch:
-
-concurrency:
-  group: jkk-watch
-  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -19,38 +14,13 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
-      # lockfile が無ければここで作る
-      - name: Ensure lockfile
-        run: |
-          if [ ! -f package-lock.json ]; then
-            echo "package-lock.json が無いので生成します"
-            npm i --package-lock-only --no-audit --no-fund
-          fi
+          node-version: '20.x'
 
       - name: Install deps
-        run: npm ci --no-audit --no-fund
-
-      # monitor.mjs / monitor.js のどちらかを自動検出
-      - name: Pick entry script
-        run: |
-          set -e
-          if [ -f monitor.mjs ]; then
-            echo "ENTRY=monitor.mjs" >> $GITHUB_ENV
-            echo "Found monitor.mjs"
-          elif [ -f monitor.js ]; then
-            echo "ENTRY=monitor.js" >> $GITHUB_ENV
-            echo "Found monitor.js"
-          else
-            echo "✗ monitor.mjs / monitor.js が見つかりません。カレント:"
-            pwd
-            ls -la
-            exit 1
-          fi
+        run: npm install --no-audit --no-fund
 
       - name: Run monitor
-        run: node "$ENTRY"
+        run: node monitor.mjs
 
       - name: Upload artifacts
         if: always()
