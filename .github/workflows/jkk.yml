@@ -1,12 +1,14 @@
 name: jkk.yml
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  # 例: 平日 9:00 に実行したい場合は下を有効化
+  # schedule:
+  #   - cron: "0 0 * * 1-5"
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -14,31 +16,30 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
-      - name: Install Google Chrome
-        run: |
-          sudo install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /etc/apt/keyrings/google.gpg
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          google-chrome --version
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
 
-      - name: Install deps
-        run: |
-          npm ci || npm i
+      - name: Install deps (no chromium download)
+        run: npm ci --ignore-scripts
 
       - name: Run monitor
         env:
-          GOOGLE_CHROME: /usr/bin/google-chrome
-        run: node monitor.mjs
+          # browser-actions/setup-chrome の出力
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          BASE_URL: https://jhomes.to-kousya.or.jp
+          # 必要ならカナをセット（空でもOK。例: "ミナミ"）
+          KANA: ""
+          WIDTH: "1440"
+          HEIGHT: "2200"
+        run: npm run monitor
 
-      - name: Upload artifacts (always)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jkk-out
           path: out/**
           if-no-files-found: warn
-          retention-days: 7
