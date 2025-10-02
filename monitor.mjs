@@ -1,4 +1,4 @@
-// 追加ヘッダで本物Chromeに寄せる版
+// monitor.mjs — popupを同一タブにリダイレクト＋headless検出回避
 import fs from "node:fs/promises";
 import path from "node:path";
 import puppeteer from "puppeteer-core";
@@ -30,21 +30,12 @@ async function savePage(page, name) {
   await ensureDir(OUT_DIR);
   const html = await page.evaluate(() => document.documentElement.outerHTML);
   await fs.writeFile(path.join(OUT_DIR, `${name}.html`), html, "utf8");
-  await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true }).catch(e => {
+  try {
+    await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true });
+  } catch (e) {
     console.warn(`[warn] screenshot failed: ${e.message}`);
-  });
+  }
   console.log(`[saved] ${name}`);
-}
-
-function waitForPopup(page, timeout = 15000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("popup timeout")), timeout);
-    page.once("popup", async (popup) => {
-      clearTimeout(timer);
-      await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
-      resolve(popup);
-    });
-  });
 }
 
 async function clickByTextAcrossFrames(page, text) {
@@ -74,12 +65,33 @@ async function main() {
   const browser = await puppeteer.launch({
     headless: true,
     executablePath,
-    args: ["--no-sandbox", `--window-size=${VIEWPORT_W},${VIEWPORT_H}`],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled", // headless検出回避
+      `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+    ],
   });
+
   const page = await browser.newPage();
+
+  // headless検出回避：navigator.webdriver削除など
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
+    Object.defineProperty(navigator, "languages", { get: () => ["ja-JP", "ja"] });
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+      parameters.name === "notifications"
+        ? Promise.resolve({ state: "granted" })
+        : originalQuery(parameters);
+    // popupを同一タブにリダイレクト
+    window.open = (url) => { window.location.href = url; };
+  });
 
   await page.setUserAgent(UA);
   await page.setExtraHTTPHeaders(EXTRA_HEADERS);
+  await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
 
   try {
     // 1) 賃貸トップ経由
@@ -94,26 +106,23 @@ async function main() {
     await page.goto(`${BASE_URL}/search/jkknet/`, { waitUntil: "domcontentloaded", referer: ENTRY_REFERER });
     await savePage(page, "home_1_after");
 
-    // 4) service + popup
-    const popupPromise = waitForPopup(page, 15000);
+    // 4) service (popupを同一タブで開くようにフック済み)
     await page.goto(`${BASE_URL}/search/jkknet/service/`, { waitUntil: "domcontentloaded" });
-    const popup = await popupPromise.catch(() => null);
     await savePage(page, "home_2");
-    if (!popup) throw new Error("popup 開けず");
 
-    await popup.setUserAgent(UA);
-    await popup.setExtraHTTPHeaders(EXTRA_HEADERS);
-    await savePage(popup, "home_2_after");
+    // 5) 「検索する」を押す（入力なし）
+    const clicked = await clickByTextAcrossFrames(page, "検索する") ||
+                    await clickByTextAcrossFrames(page, "検索");
+    await savePage(page, "after_click_raw");
 
-    // 5) 「検索する」を押す
-    const clicked = await clickByTextAcrossFrames(popup, "検索する") ||
-                    await clickByTextAcrossFrames(popup, "検索");
     if (clicked) {
-      await popup.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
-      await savePage(popup, "after_click");
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
+      await savePage(page, "after_click_final");
+    } else {
+      console.warn("[warn] 検索ボタン見つからず");
     }
 
-    console.log("[done] ✅ finished with UA+headers spoofing");
+    console.log("[done] ✅ finished (popup→同一タブ + stealth)");
   } catch (e) {
     console.error(e);
     try { await savePage(page, "final_error"); } catch {}
