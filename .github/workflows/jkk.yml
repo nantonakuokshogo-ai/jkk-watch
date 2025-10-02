@@ -3,7 +3,7 @@ name: jkk-monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # 定期実行（邪魔なら一旦コメントアウトOK）
 
 permissions:
   contents: read
@@ -31,33 +31,28 @@ jobs:
           node-version: "20"
 
       - name: Setup Chrome
-        id: setup-chrome            # ← これが必要！
+        id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Show Chrome path
-        run: echo "Using Chrome at: ${{ steps.setup-chrome.outputs.chrome-path }}"
+      # ← ここで Chrome のパスを GITHUB_ENV に書き出して後続ステップが必ず読めるようにします
+      - name: Export Chrome path
+        run: |
+          echo "PUPPETEER_EXECUTABLE_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
+          echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
+          echo "Using Chrome at: ${{ steps.chrome.outputs.chrome-path }}"
 
       - name: Install deps
         run: npm install --no-audit --no-fund
 
       - name: Run monitor
         run: npm run monitor
-        env:
-          # puppeteer-core が使う実行パスを明示
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-          BASE_URL: ${{ env.BASE_URL }}
-          KANA: ${{ env.KANA }}
-          VIEWPORT_W: ${{ env.VIEWPORT_W }}
-          VIEWPORT_H: ${{ env.VIEWPORT_H }}
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jkk-out-${{ github.run_id }}
-          path: |
-            out/**
+          path: out/**
           if-no-files-found: warn
