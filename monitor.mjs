@@ -12,20 +12,25 @@ const START_URL = "https://www.to-kousya.or.jp/chintai/index.html";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const VIEWPORT = { width: 1200, height: 2200, deviceScaleFactor: 1 };
-const OUT = (name) => path.join(__dirname, `${name}`);
+const OUT_DIR = path.join(__dirname, "out");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ===============
 
+async function ensureOutDir() {
+  await fs.mkdir(OUT_DIR, { recursive: true });
+}
+
 async function save(page, base) {
+  await ensureOutDir();
   try {
-    await fs.writeFile(OUT(`${base}.html`), await page.content(), "utf8");
+    await fs.writeFile(path.join(OUT_DIR, `${base}.html`), await page.content(), "utf8");
   } catch {}
   try {
-    await page.screenshot({ path: OUT(`${base}.png`), fullPage: true });
+    await page.screenshot({ path: path.join(OUT_DIR, `${base}.png`), fullPage: true });
   } catch (e) {
     console.warn(`[warn] screenshot failed: ${e?.message}`);
   }
-  console.log(`[saved] ${base}`);
+  console.log(`[saved] out/${base}`);
 }
 
 function chromePathFromEnv() {
@@ -48,8 +53,8 @@ async function main() {
       "--window-size=1200,2200",
       "--disable-popup-blocking",
       "--no-sandbox",
-      "--disable-setuid-sandbox"
-    ]
+      "--disable-setuid-sandbox",
+    ],
   });
 
   // ★ インコグニートは使わない（環境差で落ちないように）
@@ -60,7 +65,7 @@ async function main() {
   await page.setViewport(VIEWPORT);
   await page.setExtraHTTPHeaders({
     "Accept-Language": "ja-JP,ja;q=0.9",
-    Referer: START_URL
+    Referer: START_URL,
   });
 
   try {
@@ -73,9 +78,7 @@ async function main() {
     const SEL_SP = 'a.el_headerBtnGreen[href*="akiyaJyoukenInitMobile"]';
     const SEL_TOPBTN = "a.bl_topSelect_btn.bl_topSelect_btn__cond";
 
-    await page.waitForSelector(`${SEL_PC},${SEL_SP},${SEL_TOPBTN}`, {
-      timeout: 15000
-    });
+    await page.waitForSelector(`${SEL_PC},${SEL_SP},${SEL_TOPBTN}`, { timeout: 15000 });
 
     const pagesBefore = await browser.pages();
 
@@ -109,7 +112,7 @@ async function main() {
     await netPage.setUserAgent(UA);
     await netPage.setExtraHTTPHeaders({
       "Accept-Language": "ja-JP,ja;q=0.9",
-      Referer: START_URL
+      Referer: START_URL,
     });
 
     // 4) 遷移が落ち着くまで観測しつつ保存
@@ -117,11 +120,10 @@ async function main() {
     let lastURL = "";
     for (;;) {
       await Promise.race([
-        netPage.waitForNavigation({
-          waitUntil: "networkidle2",
-          timeout: 12000
-        }).catch(() => {}),
-        sleep(1500)
+        netPage
+          .waitForNavigation({ waitUntil: "networkidle2", timeout: 12000 })
+          .catch(() => {}),
+        sleep(1500),
       ]);
 
       const url = netPage.url();
