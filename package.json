@@ -1,11 +1,16 @@
 {
   "name": "jkk-watch",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
+  "private": true,
+  "description": "JKK 先着順あき家検索の自動巡回（GitHub Actions + puppeteer-core）",
   "scripts": {
     "monitor": "node monitor.mjs"
   },
   "dependencies": {
-    "puppeteer-core": "^23.7.0"
+    "puppeteer-core": "^23.6.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
