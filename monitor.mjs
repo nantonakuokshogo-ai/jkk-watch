@@ -1,13 +1,9 @@
-// monitor.mjs — トップ経由で正規ルートを辿る + Referer/UA ヘッダ強化 + おわび検知 & 再試行
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
+// monitor.mjs — 安定版：正規ルート遷移 + Referer/UA 付与 + おわび検知＆段階的リトライ（インターセプト未使用）
+import fs from "node:fs/promises";
+import path from "node:path";
 import puppeteer from "puppeteer-core";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const OUT_DIR = path.join(__dirname, "out");
-
+const OUT_DIR = "out";
 const VIEW_W = Number(process.env.VIEWPORT_W ?? 1440);
 const VIEW_H = Number(process.env.VIEWPORT_H ?? 2200);
 
@@ -19,7 +15,8 @@ const START_INIT = `${SERVICE_ROOT}akiyaJyoukenStartInit`;
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-const EXTRA_HEADERS = {
+
+const BASE_HEADERS = {
   "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
   "upgrade-insecure-requests": "1",
   "sec-ch-ua": '"Chromium";v="122", "Not A(Brand";v="24", "Google Chrome";v="122"',
@@ -31,10 +28,12 @@ const EXTRA_HEADERS = {
   "sec-fetch-dest": "document"
 };
 
-async function ensureOut() { await fs.mkdir(OUT_DIR, { recursive: true }); }
+async function ensureOut() {
+  await fs.mkdir(OUT_DIR, { recursive: true });
+}
 
 async function savePage(page, name) {
-  // 念のためビューポートを固定
+  // 念のため 0 幅対策
   await page.setViewport({ width: VIEW_W, height: VIEW_H, deviceScaleFactor: 1 });
   try {
     const html = await page.content();
@@ -49,19 +48,22 @@ async function savePage(page, name) {
 }
 
 async function gotoWithRef(page, url, referer) {
-  if (referer) await page.setExtraHTTPHeaders({ ...EXTRA_HEADERS, Referer: referer });
+  const headers = { ...BASE_HEADERS };
+  if (referer) headers.Referer = referer;
+  await page.setExtraHTTPHeaders(headers);
   return page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
 }
 
 async function looksLikeOwabi(page) {
-  const title = (await page.title()) || "";
-  if (title.includes("おわび")) return true;
-  const url = page.url();
-  if (url.includes("wait.jsp")) return true;
-  const hasOwabiImg = await page.evaluate(() =>
-    Array.from(document.images).some(img => /owabi|backtop_out|backtop_over/.test(img.src))
-  );
-  return hasOwabiImg;
+  const t = (await page.title()) || "";
+  if (t.includes("おわび")) return true;
+  const u = page.url();
+  if (u.includes("wait.jsp")) return true;
+  const hasOwabiHints = await page.evaluate(() => {
+    const txt = document.body?.innerText || "";
+    return /おわび|タイムアウト|もう一度|トップページへ戻る/.test(txt);
+  });
+  return hasOwabiHints;
 }
 
 async function logFrames(page, label) {
@@ -93,74 +95,83 @@ async function main() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      `--window-size=${VIEW_W},${VIEW_H}`,
+      "--disable-extensions",
       "--disable-gpu",
+      `--window-size=${VIEW_W},${VIEW_H}`,
       "--disable-blink-features=AutomationControlled"
     ]
   });
 
   const page = await browser.newPage();
 
-  // stealth っぽい調整 + popup を同一タブに
+  // 軽めの stealth ＆ popup を同一タブ化
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     Object.defineProperty(navigator, "languages", { get: () => ["ja-JP", "ja"] });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
-    // permissions.query
     const orig = navigator.permissions && navigator.permissions.query;
     if (orig) {
-      navigator.permissions.query = p =>
+      navigator.permissions.query = (p) =>
         p && p.name === "notifications" ? Promise.resolve({ state: Notification.permission }) : orig(p);
     }
-    // popup抑止
-    window.open = (url) => { window.location.href = url; };
+    window.open = (url) => { window.location.href = url; }; // popup → 同一タブ
   });
 
   await page.setUserAgent(UA);
-  await page.setExtraHTTPHeaders(EXTRA_HEADERS);
+  await page.setExtraHTTPHeaders(BASE_HEADERS);
 
   try {
-    // 1) jhomes トップ（都公社の賃貸トップをリファラに）
+    // 1) 賃貸トップを踏む（リファラ起点）
+    await gotoWithRef(page, ENTRY_REFERER, ENTRY_REFERER);
+    await savePage(page, "entry_referer");
+
+    // 2) jhomes トップ
     await gotoWithRef(page, `${BASE}/`, ENTRY_REFERER);
     await savePage(page, "home_1");
 
-    // 2) JKKねっと トップ
-    await gotoWithRef(page, JKK_TOP, ENTRY_REFERER);
+    // 3) JKKねっと トップ
+    await gotoWithRef(page, JKK_TOP, `${BASE}/`);
     await savePage(page, "home_1_after");
 
-    // 3) StartInit へ
-    await gotoWithRef(page, START_INIT, JKK_TOP);
+    // 4) service へ
+    await gotoWithRef(page, SERVICE_ROOT, JKK_TOP);
+    await savePage(page, "service_root");
+
+    // 5) StartInit へ
+    await gotoWithRef(page, START_INIT, SERVICE_ROOT);
     await logFrames(page, "startinit_1");
 
-    // 4) おわび検知 → サイト内で再試行
+    // 6) おわび検知 → 段階的にリトライ
     if (await looksLikeOwabi(page)) {
-      console.log("[info] owabi detected -> retry in-site");
+      console.log("[info] owabi detected → retry via JKK_TOP then relative navigation");
       await savePage(page, "owabi_detected");
 
+      // JKKトップに戻る
       await gotoWithRef(page, JKK_TOP, ENTRY_REFERER);
       await savePage(page, "retry_base");
 
-      // 同一タブ・相対遷移
+      // 同一タブ相対遷移
       await page.evaluate((url) => { window.location.href = url; }, "/search/jkknet/service/akiyaJyoukenStartInit");
       await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
       await logFrames(page, "startinit_2");
 
+      // まだおわびなら、service→StartInit をもう一度
       if (await looksLikeOwabi(page)) {
-        console.log("[info] still owabi -> visit service root then StartInit");
+        console.log("[info] still owabi → service → StartInit 再試行");
         await gotoWithRef(page, SERVICE_ROOT, JKK_TOP);
-        await savePage(page, "service_root");
+        await savePage(page, "service_root_retry");
 
         await gotoWithRef(page, START_INIT, SERVICE_ROOT);
         await logFrames(page, "startinit_3");
       }
     }
 
-    // 5) 成否判定
+    // 7) 最終判定
     if (await looksLikeOwabi(page)) {
       await savePage(page, "final_error");
       throw new Error("検索フォーム／結果ページへ到達できませんでした（おわびゲート）。");
     } else {
-      await savePage(page, "result_or_form"); // 到達時のフォーム or 結果を保存
+      await savePage(page, "result_or_form"); // 到達時のフォーム/結果を保存
       console.log("[done] ✅ Artifacts の out/** を確認してください。");
     }
   } catch (e) {
