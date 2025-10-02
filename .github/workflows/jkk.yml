@@ -3,7 +3,6 @@ name: jkk-monitor
 on:
   workflow_dispatch:
   schedule:
-    # 例：15分ごと
     - cron: "*/15 * * * *"
 
 permissions:
@@ -32,20 +31,27 @@ jobs:
           node-version: "20"
 
       - name: Setup Chrome
-        # CHROME_PATH を環境変数として提供
+        id: setup-chrome            # ← これが必要！
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
+      - name: Show Chrome path
+        run: echo "Using Chrome at: ${{ steps.setup-chrome.outputs.chrome-path }}"
+
       - name: Install deps
-        # package-lock を持たない運用のため npm ci ではなく install を使用
         run: npm install --no-audit --no-fund
 
       - name: Run monitor
         run: npm run monitor
         env:
-          # setup-chrome が設定する CHROME_PATH をそのまま利用
+          # puppeteer-core が使う実行パスを明示
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          BASE_URL: ${{ env.BASE_URL }}
+          KANA: ${{ env.KANA }}
+          VIEWPORT_W: ${{ env.VIEWPORT_W }}
+          VIEWPORT_H: ${{ env.VIEWPORT_H }}
 
       - name: Upload artifacts
         if: always()
