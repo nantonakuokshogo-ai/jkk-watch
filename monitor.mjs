@@ -10,15 +10,19 @@ const VIEWPORT_W = Number(process.env.VIEWPORT_W ?? 1440);
 const VIEWPORT_H = Number(process.env.VIEWPORT_H ?? 2200);
 const OUT_DIR = "out";
 
+// “普通のChrome”っぽい UA（Headless を含めない）
+const UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const ACCEPT_LANG = "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7";
+const ENTRY_REFERER = "https://www.to-kousya.or.jp/chintai/index.html";
+
 async function ensureDir(p) { await fs.mkdir(p, { recursive: true }); }
 
 async function safeScreenshot(page, filePath, { fullPage = true } = {}) {
   try {
     await page.screenshot({ path: filePath, fullPage });
     return;
-  } catch (e1) {
-    console.warn(`[warn] screenshot failed 1st: ${e1.message}`);
-  }
+  } catch (e1) { console.warn(`[warn] screenshot failed 1st: ${e1.message}`); }
   try {
     await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
     await page.evaluate(() => { if (document.body) document.body.style.minHeight = "10px"; });
@@ -50,10 +54,9 @@ function logFrames(page) {
   return frames;
 }
 
-// --- ラベル近傍 input を探索して type（フレーム横断） ---
+// ---- 入力・クリックユーティリティ（フレーム横断） ----
 async function typeByNearbyLabelAcrossFrames(page, labelText, value) {
-  const frames = page.frames();
-  for (const frame of frames) {
+  for (const frame of page.frames()) {
     const handle = await frame.evaluateHandle((text) => {
       const snapshot = document.evaluate(
         `//*[contains(normalize-space(.), "${text}")]`,
@@ -84,7 +87,7 @@ async function typeByNearbyLabelAcrossFrames(page, labelText, value) {
       await el.focus();
       await frame.evaluate((e) => (e.value = ""), el);
       await el.type(value, { delay: 20 });
-      return { frame, element: el };
+      return;
     } else {
       await handle.dispose();
     }
@@ -110,23 +113,18 @@ async function clickByTextAcrossFrames(page, text) {
   return false;
 }
 
-// --- ここが変更点：popup をイベントリスナー方式で待つ。ナビゲーション前に仕掛ける ---
+// ---- 変更点：popup 待機を once で実装（removeListener 不要） ----
 function waitForPopup(page, timeout = 15000) {
   return new Promise((resolve, reject) => {
-    const to = setTimeout(() => {
-      page.removeListener("popup", onPopup);
-      reject(new Error("popup timeout"));
-    }, timeout);
-    async function onPopup(popup) {
-      clearTimeout(to);
-      page.removeListener("popup", onPopup);
+    const timer = setTimeout(() => reject(new Error("popup timeout")), timeout);
+    page.once("popup", async (popup) => {
+      clearTimeout(timer);
       try {
         await popup.bringToFront();
         await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
       } catch {}
       resolve(popup);
-    }
-    page.on("popup", onPopup);
+    });
   });
 }
 
@@ -147,49 +145,73 @@ async function main() {
   });
 
   const page = await browser.newPage();
+
+  // “HeadlessChrome”を隠す・日本語優先・参照元付与
+  await page.setUserAgent(UA);
+  await page.setExtraHTTPHeaders({ "Accept-Language": ACCEPT_LANG });
   await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
 
   try {
-    // 入口を順に
-    await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
+    // 1) まず to-kousya 本体を踏んで Referer を作る
+    await page.goto(ENTRY_REFERER, { waitUntil: "domcontentloaded" });
+    await savePage(page, "entry_referer");
+
+    // 2) jhomes top（Referer 付き）
+    await page.goto(`${BASE_URL}/`, {
+      waitUntil: "domcontentloaded",
+      referer: ENTRY_REFERER,
+    });
     await savePage(page, "home_1");
 
-    await page.goto(`${BASE_URL}/search/jkknet/`, { waitUntil: "domcontentloaded" });
+    // 3) jkknet top
+    await page.goto(`${BASE_URL}/search/jkknet/`, {
+      waitUntil: "domcontentloaded",
+      referer: ENTRY_REFERER,
+    });
     await savePage(page, "home_1_after");
 
-    // ★ ナビゲーション前にポップアップ待ちを仕掛ける
+    // 4) service へ遷移（ここでpopup待ちを仕掛ける）
     const popupPromise = waitForPopup(page, 15000);
-
-    await page.goto(`${BASE_URL}/search/jkknet/service/`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${BASE_URL}/search/jkknet/service/`, {
+      waitUntil: "domcontentloaded",
+      referer: `${BASE_URL}/search/jkknet/`,
+    });
     await savePage(page, "home_2");
 
-    // ポップアップ取得（失敗したら手動で開くフォールバック）
+    // 5) popup 取得 or フォールバック
     let popup;
     try {
       popup = await popupPromise;
     } catch {
-      // openMainWindow() があれば実行、なければ wait.jsp を window.open
+      // openMainWindow() があればそれを使い、無ければ wait.jsp を開く
       await page.evaluate(() => {
         try { if (typeof openMainWindow === "function") { openMainWindow(); return; } } catch {}
         window.open("/search/jkknet/wait.jsp", "JKKnet");
       });
-      const target = await browser.waitForTarget(t => t.opener() && t.opener()._targetId === page.target()._targetId, { timeout: 10000 });
+      const target = await browser.waitForTarget(
+        (t) => t.opener() && t.opener()._targetId === page.target()._targetId,
+        { timeout: 10000 }
+      );
       popup = await target.page();
       await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
+      await popup.setUserAgent(UA);
+      await popup.setExtraHTTPHeaders({ "Accept-Language": ACCEPT_LANG });
     }
 
     await savePage(popup, "home_2_after");
     await savePage(popup, "frameset_startinit");
     logFrames(popup);
 
+    // 6) 「おわび」検出（念のため）
     const isOwabi = await popup.evaluate(
       () => /おわび/.test(document.title || "") || (document.body && document.body.innerText.includes("おわび"))
     );
     if (isOwabi) {
       await savePage(popup, "final_error");
-      throw new Error("「おわび」ページに遷移しました。入口フロー/Refererを再確認してください。");
+      throw new Error("「おわび」ページに遷移しました。Referer/UA 制約の可能性があります。");
     }
 
+    // 7) 入力 → 検索
     let typed = false;
     try {
       await savePage(popup, "before_fill");
