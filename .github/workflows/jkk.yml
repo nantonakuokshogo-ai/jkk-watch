@@ -1,38 +1,57 @@
-name: jkk.yml
+name: jkk-monitor
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+  schedule:
+    # 例：15分ごと
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-monitor
+  cancel-in-progress: true
 
 jobs:
-  monitor:
+  run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      BASE_URL: https://jhomes.to-kousya.or.jp
+      KANA: コーシャハイム
+      VIEWPORT_W: "1440"
+      VIEWPORT_H: "2200"
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Setup Chrome
-        id: chrome
+        # CHROME_PATH を環境変数として提供
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Install deps
-        run: npm install --ignore-scripts --no-audit --no-fund
+        # package-lock を持たない運用のため npm ci ではなく install を使用
+        run: npm install --no-audit --no-fund
 
       - name: Run monitor
-        env:
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          BASE_URL: https://jhomes.to-kousya.or.jp
-          KANA: コーシャハイム
-          WIDTH: "1440"
-          HEIGHT: "2200"
         run: npm run monitor
+        env:
+          # setup-chrome が設定する CHROME_PATH をそのまま利用
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-out
-          path: out/**
+          name: jkk-out-${{ github.run_id }}
+          path: |
+            out/**
           if-no-files-found: warn
