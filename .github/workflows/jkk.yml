@@ -1,16 +1,27 @@
 name: jkk
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 22-23,0-11 * * *"   # 例: JP朝〜昼に30分ごと
+    - cron: "*/30 * * * *"  # 30分ごと（必要に応じて調整）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-watch
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
 
-      - name: Setup Node
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -18,18 +29,38 @@ jobs:
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
-      - name: Install
-        run: npm install
+      - name: Show Chrome path
+        run: |
+          echo "Chrome path: ${{ steps.chrome.outputs.chrome-path }}"
+          "${{ steps.chrome.outputs.chrome-path }}" --version
 
-      - name: Monitor
-        run: npm run monitor
+      - name: Install deps
+        run: npm install --no-fund --no-audit
+
+      - name: Run monitor
         env:
+          # setup-chrome の出力を Puppeteer に渡す
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
-      - name: Upload artifacts
+          # 参照元（ブロック回避のため最初に踏む）
+          REFERER: "https://www.to-kousya.or.jp/chintai/index.html"
+
+          # ランチャー(wait.jsp)を直接踏む
+          WAIT_URL: "https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp"
+
+          # スクショサイズ
+          VIEWPORT_W: "1280"
+          VIEWPORT_H: "2200"
+        run: npm run monitor
+
+      - name: Upload out/**
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: out
-          path: out/
+          name: jkk-out
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 7
