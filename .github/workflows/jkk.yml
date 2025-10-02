@@ -4,48 +4,36 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/jkk.yml"
       - "monitor.mjs"
       - "package.json"
+      - ".github/workflows/jkk.yml"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Setup Chrome
-        id: chrome
-        uses: browser-actions/setup-chrome@v1
+      - uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Show versions
-        run: |
-          node -v
-          "$CHROME_PATH" --version
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      # lockfile がないため npm ci は使わず install を使います
-      - name: Install deps
+      # ロックファイルが無い想定なので install を使用
+      - name: Install
         run: npm install --no-audit --no-fund
 
-      - name: Run monitor.mjs
+      - name: Run monitor
         env:
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: node monitor.mjs
 
-      - name: Upload pages
-        if: always()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: pages-${{ github.run_number }}
-          path: pages
+          name: out
+          path: out/*
