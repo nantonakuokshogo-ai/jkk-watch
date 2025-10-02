@@ -4,16 +4,22 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - ".github/workflows/jkk.yml"
       - "monitor.mjs"
       - "package.json"
-      - ".github/workflows/jkk.yml"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Setup Chrome
         id: chrome
@@ -21,25 +27,25 @@ jobs:
         with:
           chrome-version: stable
 
-      - name: Use Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Show versions
+        run: |
+          node -v
+          "$CHROME_PATH" --version
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
-      - name: Install
+      # lockfile がないため npm ci は使わず install を使います
+      - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Monitor
+      - name: Run monitor.mjs
         env:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          BASE_URL: https://jhomes.to-kousya.or.jp
-          VIEWPORT_W: 1440
-          VIEWPORT_H: 2200
-        run: npm run monitor
+        run: node monitor.mjs
 
-      - name: Upload out/**
+      - name: Upload pages
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-watch-out
-          path: out/**
+          name: pages-${{ github.run_number }}
+          path: pages
