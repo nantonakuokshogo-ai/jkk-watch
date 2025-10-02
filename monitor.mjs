@@ -1,135 +1,134 @@
-// monitor.mjs  — JKK一覧に手堅く到達して撮る版
-import fs from "node:fs/promises";
-import path from "node:path";
+// monitor.mjs  — JKK 検索一覧まで安定して到達するための「同タブ強制」版
+// 実行:  node monitor.mjs
+// 生成物: out/ 配下に HTML と PNG を保存
+
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-core";
 
-const OUT = "out";
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const OUT_DIR = path.join(__dirname, "out");
 
+// --- small utils -------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function ensureOut() {
-  await fs.mkdir(OUT, { recursive: true });
+  await fs.mkdir(OUT_DIR, { recursive: true });
 }
-async function save(page, name) {
-  const png = path.join(OUT, `${name}.png`);
-  const html = path.join(OUT, `${name}.html`);
-  await page.screenshot({ path: png, fullPage: true });
-  await fs.writeFile(html, await page.content(), "utf8");
-  console.log("[saved]", name);
+async function save(page, base) {
+  const html = await page.content();
+  await fs.writeFile(path.join(OUT_DIR, `${base}.html`), html);
+  await page.screenshot({ path: path.join(OUT_DIR, `${base}.png`), fullPage: true });
+  console.log(`[saved] ${base}`);
 }
-function looksBlocked(htmlText, title) {
-  const t = (title||"") + "\n" + (htmlText||"");
-  return /is blocked|ERR_BLOCKED_BY_CLIENT/i.test(t);
-}
-
-async function gotoWithRef(page, url, ref) {
-  if (ref) {
-    await page.setExtraHTTPHeaders({ Referer: ref });
-  }
-  return page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+function chromePathFromEnv() {
+  // setup-chrome が設定する環境変数を優先
+  return (
+    process.env.CHROME_PATH ||
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    // GH Actions setup-chrome の既定パス（Linux）
+    "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome"
+  );
 }
 
+// --- core --------------------------------------------------------------------
 async function main() {
   await ensureOut();
 
-  const chrome = process.env.CHROME_PATH || "/usr/bin/google-chrome";
-  console.log("[monitor] Using Chrome at:", chrome);
+  const executablePath = chromePathFromEnv();
+  console.log("[monitor] Using Chrome at:", executablePath);
 
   const browser = await puppeteer.launch({
-    executablePath: chrome,
-    headless: true,                   // ここは headless のままでOK
+    executablePath,
+    headless: "new",
+    defaultViewport: { width: 1366, height: 2000 },
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-site-isolation-trials",
-      // これがキモ：ポップアップブロックを無効化
-      "--disable-popup-blocking",
-      "--window-size=1280,2600",
+      "--disable-gpu",
+      "--window-size=1366,2000",
+      // ナビ・Cookie 周りでこけないよう緩めに
+      "--disable-features=IsolateOrigins,site-per-process,SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure",
     ],
-    defaultViewport: { width: 1280, height: 1200 },
   });
 
   const page = await browser.newPage();
 
-  // 1) 賃貸トップへ
-  const TOP = "https://www.to-kousya.or.jp/chintai/index.html";
-  await gotoWithRef(page, TOP);
-  await save(page, "entry_referer");
+  // ---- ここが本筋：ポップアップを同タブに矯正、target=JKKnet を自タブに解決、元タブ閉鎖を無効化
+  await page.addInitScript(() => {
+    try { window.name = "JKKnet"; } catch {}
+    const origOpen = window.open;
+    // window.open(url, ...) を「同タブ遷移」に強制
+    window.open = function(url) {
+      if (url) location.href = url;
+      return window;
+    };
+    // 元タブ閉鎖も無効化
+    window.close = function() {};
+  });
 
-  // ブロックされない形（同一タブ）で JKKnet へ移動
-  const JKK_PC = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-  const REFERER = TOP;
+  // 念のためポップアップイベントは即座に閉じる（来ない想定だが保険）
+  page.on("popup", async (p) => { try { await p.close({ runBeforeUnload: false }); } catch {} });
 
-  // 2) まずは **直接同一タブ遷移**（最も安定）
-  await gotoWithRef(page, JKK_PC, REFERER).catch(()=>{});
-  await sleep(1500);
+  // 404 やブロックでも証跡が取れるようにダイアログ/エラーを握りつぶして続行
+  page.on("dialog", async (d) => { try { await d.dismiss(); } catch {} });
+  page.on("pageerror", (e) => console.warn("[pageerror]", e?.message || e));
+  page.on("requestfailed", (req) => {
+    // 参考ログ（AdBlock 風のエラーは ERR_BLOCKED_BY_CLIENT になりがち）
+    const f = req.failure(); 
+    if (f && /blocked_by_client/i.test(f.errorText || "")) {
+      console.warn("[warn] request blocked:", req.url());
+    }
+  });
 
-  let html = await page.content();
-  let blocked = looksBlocked(html, await page.title());
+  try {
+    // 1) トップでリファラを作る（対策が厳しいサイトほどリファラ有りの方が通る）
+    await page.goto("https://www.jkktokyo.or.jp/", { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await sleep(1000);
+    await save(page, "entry_referer");
 
-  // 3) もしブロック面なら、トップへ戻って「お部屋を検索」の target を外してクリック
-  if (blocked || !/jhomes\.to-kousya\.or\.jp/i.test(page.url())) {
-    await gotoWithRef(page, TOP);
-    // PC用の「お部屋を検索」リンク（target=JKKnet）を同一タブに書き換えてクリック
-    const clicked = await page.evaluate(() => {
-      const a = document.querySelector('a[href*="akiyaJyoukenStartInit"]');
-      if (!a) return false;
-      a.removeAttribute("target"); // ← ポップアップ化を防ぐ
-      a.click();
-      return true;
+    // 2) 中継 wait.jsp へ。onload で window.open + POST だが、同タブへ矯正済み。
+    //    その後 /service/* へ POST され、フレーム or 404 へ遷移する。
+    await page.goto("https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp", {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
     });
-    if (clicked) {
-      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(()=>{});
-      await sleep(1000);
-    }
+
+    // onload スクリプト→POST→遷移まで待つ（ネットワークの揺らぎを考慮してゆっくり）
+    await sleep(4000);
+    // 遷移先を待つ。フレームページでも load は来るので合わせて待機
+    try {
+      await page.waitForLoadState?.("load"); // Playwright 互換 API があれば
+    } catch {}
+    await page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => {});
+
+    // 3) ここで到達先は 404 か検索フォームのどちらか。
+    //    ひとまずスナップショットを残す。
+    await save(page, "after_wait");
+
+    // 4) 到達先が検索フォーム/フレームかどうかを軽く判定して、もう一枚撮る
+    const kind = await page.evaluate(() => {
+      // フレームセット or 検索フォームの「検索する」ボタン存在チェックなど軽めに
+      if (document.querySelector("frame, frameset")) return "frames";
+      if ([...document.querySelectorAll("input,button")].some(b => /検索/.test(b.value || b.textContent || ""))) return "form";
+      if (document.title && /見つかりません|not found|404/i.test(document.title)) return "404";
+      return "other";
+    });
+    await save(page, `result_or_form_${kind}`);
+
+    // 5) （将来の拡張）ここから検索ボタン押下や結果一覧スクショ取得ロジックを追加していく想定。
+    //    まずは “確実に辿り着く” ことを最優先にここで終了。
+  } catch (err) {
+    console.error(err);
+    try { await save(page, "final_error"); } catch {}
+    process.exitCode = 1;
+  } finally {
+    await browser.close().catch(() => {});
   }
-
-  // 4) それでもダメならポップアップを **許可** して捕まえる
-  html = await page.content();
-  blocked = looksBlocked(html, await page.title());
-  if (blocked || !/jhomes\.to-kousya\.or\.jp/i.test(page.url())) {
-    await gotoWithRef(page, TOP);
-    const [popup] = await Promise.all([
-      page.waitForEvent("popup").catch(()=>null),
-      page.evaluate(() => {
-        const a = document.querySelector('a[href*="akiyaJyoukenStartInit"]');
-        if (a) a.click(); // target=JKKnet のままクリック（popup を待つ）
-      }),
-    ]);
-    if (popup) {
-      await popup.bringToFront();
-      await popup.waitForLoadState?.("domcontentloaded").catch(()=>{});
-      // 以降は popup 側を操作する
-      // puppeteer-core v22 でも互換的に扱えるよう簡素に
-      // @ts-ignore
-      page.close?.().catch(()=>{});
-      // @ts-ignore
-      page = popup;
-    }
-  }
-
-  // 5) ここで jhomes ドメイン上にいれば勝ち。読み込みを少し待って撮る
-  await sleep(1500);
-  await save(page, "after_wait");
-
-  // 6) ブロック判定したら、証跡だけ残して終了
-  html = await page.content();
-  if (looksBlocked(html, await page.title())) {
-    console.log("[warn] Chrome にブロックされました（ERR_BLOCKED_BY_CLIENT）。証跡を保存して終了します。");
-    await save(page, "result_or_form");
-    await browser.close();
-    return;
-  }
-
-  // 7) 可能なら “フォーム or 一覧 or タイムアウト画面” をもう1枚
-  await save(page, "result_or_form");
-
-  await browser.close();
 }
 
 main().catch(async (e) => {
   console.error(e);
-  await ensureOut();
-  await fs.writeFile(path.join(OUT, "final_error.txt"), String(e.stack || e), "utf8");
-  process.exit(1);
+  process.exitCode = 1;
 });
