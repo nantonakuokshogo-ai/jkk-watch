@@ -1,174 +1,96 @@
+// monitor.mjs
 import fs from "fs/promises";
-import path from "path";
 import puppeteer from "puppeteer-core";
 
-const CHROME =
-  process.env.CHROME_PATH ||
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome";
-
-const OUT = path.resolve("./out");
-await fs.mkdir(OUT, { recursive: true });
-
-function log(...a) { console.log(...a); }
+const CHROME = process.env.CHROME_PATH || "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome";
+const ENTRY = "https://www.to-kousya.or.jp/chintai/index.html";
 
 async function savePage(page, name) {
-  const html = await page.content();
-  await fs.writeFile(path.join(OUT, `${name}.html`), html, "utf8");
   try {
-    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+    const html = await page.content();
+    await fs.writeFile(`${name}.html`, html);
+    await page.screenshot({ path: `${name}.png`, fullPage: true });
+    console.log(`[saved] ${name}`);
   } catch (e) {
-    // 稀に 0 width エラーになる場合のリトライ
-    log(`[warn] screenshot retry for ${name}:`, String(e.message || e));
-    await page.setViewport({ width: 1280, height: 2400, deviceScaleFactor: 1 });
-    await page.waitForTimeout(500);
-    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+    console.warn(`[warn] savePage failed: ${e.message}`);
   }
-  log(`[saved] ${name}`);
-}
-
-async function waitPageByTarget(browser, predicate, timeout = 25000) {
-  const target = await browser.waitForTarget(t => {
-    try { return predicate(t); } catch { return false; }
-  }, { timeout });
-  return await target.page();
 }
 
 async function main() {
-  log("[monitor] Using Chrome at:", CHROME);
-
   const browser = await puppeteer.launch({
     executablePath: CHROME,
-    headless: true,
+    headless: "new",
     args: [
       "--no-sandbox",
-      "--disable-gpu",
       "--disable-dev-shm-usage",
-      "--window-size=1280,2400",
-      // 余計なブロックを避ける
-      "--disable-features=BlockInsecurePrivateNetworkRequests"
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=site-per-process,IsolateOrigins,BlockInsecurePrivateNetworkRequests",
     ],
-    defaultViewport: { width: 1280, height: 2400, deviceScaleFactor: 1 }
   });
 
+  const page = await browser.newPage();
+  // PCレイアウトを確実に出す。SPでも動くように後で分岐するのでOK
+  await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
+  page.setDefaultTimeout(25000);
+
   try {
-    const page = await browser.newPage();
-
-    // HeadlessChrome バレ低減（UAだけで十分）
-    await page.setUserAgent(
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    );
-    await page.setExtraHTTPHeaders({
-      "accept-language": "ja,en;q=0.8"
-    });
-
-    // 1) 公式賃貸トップへ
-    const ENTRY = "https://www.to-kousya.or.jp/chintai/index.html";
-    await page.goto(ENTRY, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForSelector("body", { timeout: 30000 });
+    // 1) 参照元となるJKK賃貸トップへ
+    await page.goto(ENTRY, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("a[href*='akiyaJyouken'], a[href*='jkknet/service/']", { timeout: 15000 });
     await savePage(page, "entry_referer");
 
-    // 2) 「こだわり条件からさがす」をクリックして JKKnet を別タブで開く
-    // PC/スマホの両方を許容（どちらかがあればOK）
-    const selectorPc = 'a[href*="akiyaJyoukenStartInit"]';
-    const selectorSp = 'a[href*="akiyaJyoukenInitMobile"]';
+    // 2) 画面に出ている方の検索リンクの href を取得（PC/SPどちらでもOK）
+    const targetHref = await page.evaluate(() => {
+      // 見えている a を優先（getBoundingClientRect で幅/高さをチェック）
+      const candidates = Array.from(document.querySelectorAll(
+        "a[href*='akiyaJyoukenStartInit'], a[href*='akiyaJyoukenInitMobile'], a[href*='jkknet/service/akiyaJyouken']"
+      ));
 
-    const hasPc = await page.$(selectorPc);
-    const hasSp = await page.$(selectorSp);
+      function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      }
 
-    const popupPromise = new Promise(resolve => {
-      page.once("popup", resolve); // Puppeteer 純正
+      const visible = candidates.find(isVisible) || candidates[0];
+      return visible ? visible.href : null;
     });
 
-    if (hasPc) {
-      await page.click(selectorPc, { delay: 50 });
-    } else if (hasSp) {
-      await page.click(selectorSp, { delay: 50 });
-    } else {
-      throw new Error("賃貸トップに検索リンクが見つかりませんでした");
+    if (!targetHref) {
+      throw new Error("検索リンクの href を取得できませんでした。");
     }
 
-    // 3) 新規タブ（JKKnet）を取得
-    /** @type {import('puppeteer-core').Page} */
-    let jkkPage;
+    // 3) クリックせずに直接遷移（Referer を明示）
     try {
-      jkkPage = await Promise.race([
-        popupPromise,
-        waitPageByTarget(
-          browser,
-          t => t.type() === "page" && /jhomes\.to-kousya\.or\.jp/.test(t.url())
-        )
-      ]);
-    } catch {
-      // まれに popup イベントが来ないことがあるので保険
-      jkkPage = await waitPageByTarget(
-        browser,
-        t => t.type() === "page" && /jhomes\.to-kousya\.or\.jp/.test(t.url())
-      );
+      await page.goto(targetHref, {
+        waitUntil: "domcontentloaded",
+        referer: ENTRY,
+        timeout: 25000,
+      });
+    } catch (e) {
+      // まれにリダイレクト等で失敗する場合の再試行
+      console.warn(`[warn] first goto failed: ${e.message}`);
+      await page.waitForTimeout(1500);
+      await page.goto(targetHref, {
+        waitUntil: "domcontentloaded",
+        referer: ENTRY,
+        timeout: 25000,
+      });
     }
-    if (!jkkPage) throw new Error("JKKnet のタブを取得できませんでした");
+    await savePage(page, "after_click_raw");
 
-    await jkkPage.bringToFront();
-    await jkkPage.waitForTimeout(800); // フレーム構築待ち
-    await savePage(jkkPage, "frameset_startinit");
+    // 4) 結果 or フォーム初期画面を保存（どちらでもOKという要件）
+    //    何かしらフォーム/表が出るまで軽く待つ
+    await page.waitForTimeout(1000);
+    await savePage(page, "result_or_form");
 
-    // 4) まずはフォーム初期画面 or ウェイト画面を撮る
-    // （frameset の場合もあるのでトップを保存済み）
-    // その後、可能なら「検索する」相当を押す（入力は無視）
-    let clicked = false;
-    for (const fr of jkkPage.frames()) {
-      try {
-        // ボタンの候補を片っ端から探す
-        const btn =
-          (await fr.$('input[type="submit"][value*="検索"]')) ||
-          (await fr.$('input[type="image"][alt*="検索"]')) ||
-          (await fr.$('button:has-text("検索")')) ||
-          (await fr.$('input[name="search"]'));
-        if (btn) {
-          await btn.click({ delay: 50 });
-          clicked = true;
-          break;
-        }
-      } catch {}
-    }
-
-    // 5) 結果 or そのままフォームを保存
-    if (clicked) {
-      // 同一タブ遷移 or 別タブポップアップの両方に対応
-      let resultPage = jkkPage;
-      try {
-        const maybeNew = await waitPageByTarget(
-          browser,
-          t =>
-            t.type() === "page" &&
-            /jhomes\.to-kousya\.or\.jp/.test(t.url()) &&
-            t.url() !== jkkPage.url(),
-          8000
-        );
-        if (maybeNew) resultPage = await maybeNew;
-      } catch {}
-      await resultPage.bringToFront();
-      await resultPage.waitForTimeout(1000);
-      await savePage(resultPage, "result_or_form");
-    } else {
-      // クリックできなければ現状のフォームを再保存
-      await savePage(jkkPage, "result_or_form");
-    }
-
+  } catch (err) {
+    console.error(err);
+    await savePage(page, "final_error");
+    process.exitCode = 1;
   } finally {
-    // ブラウザは必ず閉じる
-    await new Promise(r => setTimeout(r, 250));
-    await (await puppeteer.connect) // ダミー対策
-    ; // no-op
+    await browser.close();
   }
 }
 
-main().catch(async (e) => {
-  console.error(e);
-  // 失敗時の最終画面を残す
-  try {
-    const errHtml = `<pre>${String(e.stack || e.message || e)}</pre>`;
-    await fs.writeFile(path.join(OUT, "final_error.html"), errHtml, "utf8");
-  } catch {}
-  process.exit(1);
-});
+main();
