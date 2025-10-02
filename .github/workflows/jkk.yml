@@ -1,12 +1,8 @@
 name: jkk
-
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "monitor.mjs"
-      - "package.json"
-      - ".github/workflows/jkk.yml"
+  schedule:
+    - cron: "*/30 22-23,0-11 * * *"   # 例: JP朝〜昼に30分ごと
 
 jobs:
   run:
@@ -14,26 +10,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: browser-actions/setup-chrome@v1
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          chrome-version: stable
+          node-version: "20"
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
 
-      # ロックファイルが無い想定なので install を使用
       - name: Install
-        run: npm install --no-audit --no-fund
+        run: npm install
 
-      - name: Run monitor
+      - name: Monitor
+        run: npm run monitor
         env:
-          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-        run: node monitor.mjs
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: out
-          path: out/*
+          path: out/
