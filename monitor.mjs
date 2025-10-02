@@ -1,35 +1,91 @@
+// monitor.mjs
 import fs from "fs/promises";
 import path from "path";
 import puppeteer from "puppeteer-core";
 
 const CHROME =
-  process.env.CHROME_PATH ||
   process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH ||
   "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome";
 
-const OUT = path.resolve("./out");
+const OUT   = path.resolve("./out");
 const ENTRY = "https://www.to-kousya.or.jp/chintai/index.html";
+const WAIT  = "https://www.to-kousya.or.jp/search/jkknet/wait.jsp";
 
 await fs.mkdir(OUT, { recursive: true });
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function savePage(page, name) {
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const save  = async (page, name) => {
+  try { await fs.writeFile(path.join(OUT, `${name}.html`), await page.content(), "utf8"); } catch {}
   try {
-    const html = await page.content();
-    await fs.writeFile(path.join(OUT, `${name}.html`), html, "utf8");
-    try {
-      await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
-    } catch (e) {
-      // 0 width 対策
-      await page.setViewport({ width: 1280, height: 2200, deviceScaleFactor: 1 });
-      await sleep(300);
-      await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
-    }
-    console.log(`[saved] ${name}`);
-  } catch (e) {
-    console.warn(`[warn] savePage ${name}: ${e.message}`);
+    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+  } catch {
+    // 0 width 対策
+    await page.setViewport({ width: 1365, height: 2200, deviceScaleFactor: 1 });
+    await sleep(250);
+    try { await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true }); } catch {}
   }
+  console.log(`[saved] ${name}`);
+};
+
+// 'popup'を確実に取る（v23 でも安全）
+function waitForPopup(page, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      page.off("popup", onPopup);
+      reject(new Error("popup timeout"));
+    }, timeout);
+    const onPopup = (p) => { clearTimeout(timer); page.off("popup", onPopup); resolve(p); };
+    page.on("popup", onPopup);
+  });
+}
+
+// 目的ドメインへフォールバック遷移（Referer付き）
+async function gotoOne(ctx, url, referer) {
+  try {
+    await ctx.goto(url, { waitUntil: "domcontentloaded", referer, timeout: 30000 });
+    return true;
+  } catch (e) {
+    console.warn(`[warn] goto fail: ${url} -> ${e.message}`);
+    return false;
+  }
+}
+
+// “検索する” を見つけたら押す（失敗は無視）
+async function tryPressSearch(ctx) {
+  for (const fr of ctx.frames()) {
+    try {
+      const clicked = await fr.evaluate(() => {
+        const vis = (el) => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+        };
+        const pool = Array.from(document.querySelectorAll('input[type="submit"],input[type="image"],button,a'));
+        const btn  = pool.find(el => /検索/.test((el.value||el.alt||el.textContent||"").trim()) && vis(el));
+        if (btn) { btn.click(); return true; }
+        return false;
+      });
+      if (clicked) return true;
+    } catch {}
+  }
+  return false;
+}
+
+// 一覧 or 初期フォームらしさを軽く判定（撮る対象が出たかどうか）
+async function looksReady(ctx) {
+  const url = ctx.url();
+  if (/jhomes\.to-kousya\.or\.jp\/search\/jkknet\/service/.test(url)) return true;
+  for (const fr of ctx.frames()) {
+    try {
+      const hasKeywords = await fr.evaluate(() => {
+        const t = document.body ? document.body.innerText : "";
+        return /検索条件|物件一覧|該当件数|条件をクリア|検索する/.test(t);
+      });
+      if (hasKeywords) return true;
+    } catch {}
+  }
+  return false;
 }
 
 async function main() {
@@ -37,90 +93,76 @@ async function main() {
 
   const browser = await puppeteer.launch({
     executablePath: CHROME,
-    headless: true, // 互換性重視（"new" は使わない）
+    headless: true, // 互換性重視
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-features=BlockInsecurePrivateNetworkRequests",
-      "--window-size=1280,2200",
+      "--window-size=1365,2200",
+      "--lang=ja-JP",
     ],
-    defaultViewport: { width: 1280, height: 2200, deviceScaleFactor: 1 },
+    defaultViewport: { width: 1365, height: 2200, deviceScaleFactor: 1 },
   });
 
   const page = await browser.newPage();
   page.setDefaultTimeout(30000);
+  await page.setExtraHTTPHeaders({ "Accept-Language": "ja,en;q=0.9" });
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   );
 
+  let ctx = page; // 以降の操作対象（popup発生なら置き換える）
+
   try {
-    // 1) 賃貸トップ（Referer になる）
+    // 1) 参照元（念のためキャプチャ）
     await page.goto(ENTRY, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("a[href*='akiyaJyouken'], a[href*='jkknet/service/']", { timeout: 20000 });
-    await savePage(page, "entry_referer");
+    await save(page, "entry_referer");
 
-    // 2) 画面に表示されている方のリンクの href を拾う（PC/SP両対応）
-    const targetHref = await page.evaluate(() => {
-      const qs =
-        "a[href*='akiyaJyoukenStartInit'], a[href*='akiyaJyoukenInitMobile'], a[href*='jkknet/service/akiyaJyouken']";
-      const links = Array.from(document.querySelectorAll(qs));
-      const isVisible = (el) => {
-        const r = el.getBoundingClientRect();
-        const s = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-      };
-      const vis = links.find(isVisible) || links[0];
-      return vis ? vis.href : null;
-    });
-
-    if (!targetHref) throw new Error("検索リンクの href を取得できませんでした。");
-
-    // 3) クリックせずに直接遷移（Referer 明示）
-    try {
-      await page.goto(targetHref, { waitUntil: "domcontentloaded", referer: ENTRY, timeout: 30000 });
-    } catch (e) {
-      console.warn("[warn] first goto failed, retrying:", e.message);
-      await sleep(1200);
-      await page.goto(targetHref, { waitUntil: "domcontentloaded", referer: ENTRY, timeout: 30000 });
+    // 2) wait.jsp 経由で popup 捕捉（または同タブ遷移）
+    let popup = null;
+    const popPromise = waitForPopup(page, 12000);
+    await page.goto(WAIT, { waitUntil: "domcontentloaded", referer: ENTRY });
+    try { popup = await popPromise; } catch {}
+    if (popup && !popup.isClosed()) {
+      ctx = popup;
+      await ctx.bringToFront();
     }
-    await savePage(page, "after_click_raw");
+    await save(ctx, "after_wait");
 
-    // 4) 可能なら “検索” を押す（入力はしない）。失敗しても無視。
-    let clicked = false;
-    for (const fr of page.frames()) {
-      try {
-        const ok = await fr.evaluate(() => {
-          const isVisible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-          };
-          const pool = [
-            ...document.querySelectorAll('input[type="submit"], input[type="image"], button, a'),
-          ];
-          for (const el of pool) {
-            const text = (el.value || el.textContent || el.alt || "").trim();
-            if (/検索/.test(text) && isVisible(el)) {
-              el.click();
-              return true;
-            }
-          }
-          return false;
-        });
-        if (ok) { clicked = true; break; }
-      } catch {}
+    // 3) ここで結果に辿り着けない場合のフォールバック（順にトライ）
+    const candidates = [
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenInitMobile"
+    ];
+    let reached = await looksReady(ctx);
+    for (let i = 0; i < 2 && !reached; i++) { // 最大2周（軽いリトライ）
+      for (const url of candidates) {
+        if (reached) break;
+        const ok = await gotoOne(ctx, url, WAIT);
+        if (ok) {
+          await save(ctx, `candidate_${i}`);
+          reached = await looksReady(ctx);
+          if (!reached) await sleep(800);
+        }
+      }
     }
-    if (clicked) await sleep(2000);
 
-    // 5) 結果 or そのままフォームのスクショ
-    await savePage(page, "result_or_form");
+    // 4) 可能なら “検索する” を押して一覧へ（失敗は無視）
+    if (await tryPressSearch(ctx)) {
+      await sleep(1800);
+      reached = await looksReady(ctx);
+    }
+
+    // 5) 最終キャプチャ（到達できていなくても証跡を残す）
+    await save(ctx, reached ? "result_or_form" : "final_error");
 
   } catch (e) {
     console.error(e);
-    await savePage(page, "final_error");
-    process.exit(1);
+    try { await save(ctx, "final_error"); } catch {}
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
