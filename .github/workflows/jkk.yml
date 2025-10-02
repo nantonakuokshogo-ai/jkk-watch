@@ -2,18 +2,14 @@ name: jkk.yml
 
 on:
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "0 0 * * 1-5"
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
@@ -21,15 +17,14 @@ jobs:
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # ← ここを npm ci ではなく npm install に変更
-      - name: Install deps (no chromium download)
+      - name: Install deps
         run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: Run monitor
         env:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
           BASE_URL: https://jhomes.to-kousya.or.jp
-          KANA: ""
+          KANA: コーシャハイム
           WIDTH: "1440"
           HEIGHT: "2200"
         run: npm run monitor
