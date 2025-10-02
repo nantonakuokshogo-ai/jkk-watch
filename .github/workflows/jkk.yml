@@ -26,8 +26,8 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install
-        run: npm ci
+- name: Install
+  run: npm install --no-audit --no-fund
 
       - name: Monitor
         env:
