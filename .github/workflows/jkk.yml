@@ -2,7 +2,6 @@ name: jkk.yml
 
 on:
   workflow_dispatch: {}
-  # 例: 平日 9:00 に実行したい場合は下を有効化
   # schedule:
   #   - cron: "0 0 * * 1-5"
 
@@ -22,15 +21,14 @@ jobs:
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
+      # ← ここを npm ci ではなく npm install に変更
       - name: Install deps (no chromium download)
-        run: npm ci --ignore-scripts
+        run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: Run monitor
         env:
-          # browser-actions/setup-chrome の出力
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
           BASE_URL: https://jhomes.to-kousya.or.jp
-          # 必要ならカナをセット（空でもOK。例: "ミナミ"）
           KANA: ""
           WIDTH: "1440"
           HEIGHT: "2200"
