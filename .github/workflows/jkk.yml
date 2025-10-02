@@ -1,34 +1,19 @@
-name: jkk-monitor
+name: jkk
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"   # 定期実行（邪魔なら一旦コメントアウトOK）
-
-permissions:
-  contents: read
-
-concurrency:
-  group: jkk-monitor
-  cancel-in-progress: true
+  push:
+    paths:
+      - "monitor.mjs"
+      - "package.json"
+      - ".github/workflows/jkk.yml"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      BASE_URL: https://jhomes.to-kousya.or.jp
-      KANA: コーシャハイム
-      VIEWPORT_W: "1440"
-      VIEWPORT_H: "2200"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
 
       - name: Setup Chrome
         id: chrome
@@ -36,23 +21,23 @@ jobs:
         with:
           chrome-version: stable
 
-      # ← ここで Chrome のパスを GITHUB_ENV に書き出して後続ステップが必ず読めるようにします
-      - name: Export Chrome path
-        run: |
-          echo "PUPPETEER_EXECUTABLE_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-          echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-          echo "Using Chrome at: ${{ steps.chrome.outputs.chrome-path }}"
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      - name: Install deps
-        run: npm install --no-audit --no-fund
+      - name: Install
+        run: npm ci
 
-      - name: Run monitor
+      - name: Monitor
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          BASE_URL: https://jhomes.to-kousya.or.jp
         run: npm run monitor
 
-      - name: Upload artifacts
+      - name: Upload out/**
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-out-${{ github.run_id }}
+          name: jkk-watch-out
           path: out/**
-          if-no-files-found: warn
