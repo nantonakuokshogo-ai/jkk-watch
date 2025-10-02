@@ -1,5 +1,5 @@
 // monitor.mjs
-// Node20 + puppeteer-core v23 / 旧API未使用（waitForTimeout等）
+// Node20 + puppeteer-core v23 / 旧API未使用
 import fs from "node:fs/promises";
 import path from "node:path";
 import puppeteer from "puppeteer-core";
@@ -10,28 +10,18 @@ const VIEWPORT_W = Number(process.env.VIEWPORT_W ?? 1440);
 const VIEWPORT_H = Number(process.env.VIEWPORT_H ?? 2200);
 const OUT_DIR = "out";
 
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true });
-}
+async function ensureDir(p) { await fs.mkdir(p, { recursive: true }); }
 
 async function safeScreenshot(page, filePath, { fullPage = true } = {}) {
-  // 1st try
   try {
     await page.screenshot({ path: filePath, fullPage });
     return;
   } catch (e1) {
     console.warn(`[warn] screenshot failed 1st: ${e1.message}`);
   }
-  // Re-ensure viewport then retry
   try {
     await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
-    // 最低限の高さを確保（空DOMで0高さになっている場合の保険）
-    await page.evaluate(() => {
-      if (document.body) {
-        document.body.style.minHeight = "10px";
-      }
-    });
-    // 少しでもレイアウトが立ったら撮り直し
+    await page.evaluate(() => { if (document.body) document.body.style.minHeight = "10px"; });
     await page.waitForFunction(
       () => document.documentElement.clientWidth > 0 && document.documentElement.clientHeight > 0,
       { timeout: 3000 }
@@ -39,10 +29,7 @@ async function safeScreenshot(page, filePath, { fullPage = true } = {}) {
     await page.screenshot({ path: filePath, fullPage });
   } catch (e2) {
     console.warn(`[warn] screenshot failed 2nd: ${e2.message}`);
-    // 最後は viewport クリップで妥協撮影
-    try {
-      await page.screenshot({ path: filePath, fullPage: false });
-    } catch (e3) {
+    try { await page.screenshot({ path: filePath, fullPage: false }); } catch (e3) {
       console.warn(`[warn] screenshot final failed: ${e3.message}`);
     }
   }
@@ -63,39 +50,24 @@ function logFrames(page) {
   return frames;
 }
 
-// ラベル近傍 input を探索して type（フレーム横断）
+// --- ラベル近傍 input を探索して type（フレーム横断） ---
 async function typeByNearbyLabelAcrossFrames(page, labelText, value) {
   const frames = page.frames();
   for (const frame of frames) {
     const handle = await frame.evaluateHandle((text) => {
       const snapshot = document.evaluate(
         `//*[contains(normalize-space(.), "${text}")]`,
-        document,
-        null,
-        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
-        null
+        document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
       );
       function findInputNear(el) {
         const q = 'input[type="text"], input:not([type]), input[type="search"]';
-        let inp = el.querySelector(q);
-        if (inp) return inp;
+        let inp = el.querySelector(q); if (inp) return inp;
         const cell = el.closest("td,th,div,li,label,dt,dd");
-        if (cell?.nextElementSibling) {
-          inp = cell.nextElementSibling.querySelector(q);
-          if (inp) return inp;
-        }
+        if (cell?.nextElementSibling) { inp = cell.nextElementSibling.querySelector(q); if (inp) return inp; }
         let p = el.parentElement;
-        for (let i = 0; i < 4 && p; i++) {
-          inp = p.querySelector(q);
-          if (inp) return inp;
-          p = p.parentElement;
-        }
-        if (cell?.parentElement) {
-          const sibs = Array.from(cell.parentElement.children);
-          for (const s of sibs) {
-            inp = s.querySelector(q);
-            if (inp) return inp;
-          }
+        for (let i = 0; i < 4 && p; i++) { inp = p.querySelector(q); if (inp) return inp; p = p.parentElement; }
+        if (cell?.parentElement) for (const s of Array.from(cell.parentElement.children)) {
+          inp = s.querySelector(q); if (inp) return inp;
         }
         return null;
       }
@@ -121,20 +93,16 @@ async function typeByNearbyLabelAcrossFrames(page, labelText, value) {
 }
 
 async function clickByTextAcrossFrames(page, text) {
-  const frames = page.frames();
-  for (const frame of frames) {
+  for (const frame of page.frames()) {
     const clicked = await frame.evaluate((t) => {
       t = t.trim();
-      const clickEl = (el) => {
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-        return true;
-      };
-      const inputs = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"]'));
-      for (const i of inputs) if ((i.value || "").trim().includes(t)) return clickEl(i);
-      const btns = Array.from(document.querySelectorAll("button"));
-      for (const b of btns) if ((b.textContent || "").trim().includes(t)) return clickEl(b);
-      const anchors = Array.from(document.querySelectorAll("a"));
-      for (const a of anchors) if ((a.textContent || "").trim().includes(t)) return clickEl(a);
+      const clickEl = (el) => { el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); return true; };
+      for (const i of Array.from(document.querySelectorAll('input[type="submit"], input[type="button"]')))
+        if ((i.value || "").trim().includes(t)) return clickEl(i);
+      for (const b of Array.from(document.querySelectorAll("button")))
+        if ((b.textContent || "").trim().includes(t)) return clickEl(b);
+      for (const a of Array.from(document.querySelectorAll("a")))
+        if ((a.textContent || "").trim().includes(t)) return clickEl(a);
       return false;
     }, text);
     if (clicked) return true;
@@ -142,13 +110,24 @@ async function clickByTextAcrossFrames(page, text) {
   return false;
 }
 
-async function waitForPopupFrom(page) {
-  const popup = await page.waitForEvent("popup", { timeout: 15000 });
-  await popup.bringToFront();
-  // popup にも viewport を適用（0x0対策）
-  await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
-  console.log(`[popup] targetName=${popup.target()._targetInfo?.targetName ?? ""}`);
-  return popup;
+// --- ここが変更点：popup をイベントリスナー方式で待つ。ナビゲーション前に仕掛ける ---
+function waitForPopup(page, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => {
+      page.removeListener("popup", onPopup);
+      reject(new Error("popup timeout"));
+    }, timeout);
+    async function onPopup(popup) {
+      clearTimeout(to);
+      page.removeListener("popup", onPopup);
+      try {
+        await popup.bringToFront();
+        await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
+      } catch {}
+      resolve(popup);
+    }
+    page.on("popup", onPopup);
+  });
 }
 
 async function main() {
@@ -163,35 +142,43 @@ async function main() {
   const browser = await puppeteer.launch({
     headless: true,
     executablePath,
-    // ここでウィンドウサイズを固定し、defaultViewport は null にする（0x0回避）
     defaultViewport: null,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      `--window-size=${VIEWPORT_W},${VIEWPORT_H}`
-    ],
+    args: ["--no-sandbox", "--disable-setuid-sandbox", `--window-size=${VIEWPORT_W},${VIEWPORT_H}`],
   });
 
   const page = await browser.newPage();
-  // 念のため明示設定
   await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
 
   try {
-    // 入口を段階的に踏む
+    // 入口を順に
     await page.goto(`${BASE_URL}/`, { waitUntil: "domcontentloaded" });
     await savePage(page, "home_1");
 
     await page.goto(`${BASE_URL}/search/jkknet/`, { waitUntil: "domcontentloaded" });
     await savePage(page, "home_1_after");
 
+    // ★ ナビゲーション前にポップアップ待ちを仕掛ける
+    const popupPromise = waitForPopup(page, 15000);
+
     await page.goto(`${BASE_URL}/search/jkknet/service/`, { waitUntil: "domcontentloaded" });
     await savePage(page, "home_2");
 
-    // popup 捕捉
-    const popup = await waitForPopupFrom(page);
-    await savePage(popup, "home_2_after");
+    // ポップアップ取得（失敗したら手動で開くフォールバック）
+    let popup;
+    try {
+      popup = await popupPromise;
+    } catch {
+      // openMainWindow() があれば実行、なければ wait.jsp を window.open
+      await page.evaluate(() => {
+        try { if (typeof openMainWindow === "function") { openMainWindow(); return; } } catch {}
+        window.open("/search/jkknet/wait.jsp", "JKKnet");
+      });
+      const target = await browser.waitForTarget(t => t.opener() && t.opener()._targetId === page.target()._targetId, { timeout: 10000 });
+      popup = await target.page();
+      await popup.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
+    }
 
-    // 初期表示保存
+    await savePage(popup, "home_2_after");
     await savePage(popup, "frameset_startinit");
     logFrames(popup);
 
