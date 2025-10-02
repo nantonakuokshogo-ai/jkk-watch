@@ -26,13 +26,15 @@ jobs:
         with:
           node-version: 20
 
-- name: Install
-  run: npm install --no-audit --no-fund
+      - name: Install
+        run: npm install --no-audit --no-fund
 
       - name: Monitor
         env:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
           BASE_URL: https://jhomes.to-kousya.or.jp
+          VIEWPORT_W: 1440
+          VIEWPORT_H: 2200
         run: npm run monitor
 
       - name: Upload out/**
