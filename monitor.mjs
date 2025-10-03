@@ -1,130 +1,128 @@
 // monitor.mjs
-// Run: npm run monitor
-import fs from "fs/promises";
-import path from "path";
+import fs from "node:fs/promises";
+import path from "node:path";
 import puppeteer from "puppeteer-core";
 
-const outDir = path.resolve("out");
-await fs.mkdir(outDir, { recursive: true });
+const OUT_DIR = "out";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome";
-
-function esc(s = "") {
-  return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+async function ensureOut() {
+  await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
-async function saveHtmlPng(base, html, page) {
-  const htmlPath = path.join(outDir, `${base}.html`);
-  const pngPath  = path.join(outDir, `${base}.png`);
-  await fs.writeFile(htmlPath, html);
-  await page.screenshot({ path: pngPath, fullPage: true });
-  console.log(`[saved] ${base}`);
+async function saveHtml(name, html) {
+  await ensureOut();
+  await fs.writeFile(path.join(OUT_DIR, `${name}.html`), html, "utf8");
 }
 
-async function gotoWithRetry(page, url, tries = 3, timeout = 15000) {
-  let lastErr;
-  for (let i = 1; i <= tries; i++) {
-    console.log(`[goto] ${url} (${i}/${tries})`);
-    try {
-      const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-      // 200台ならOK扱い
-      if (resp && resp.ok()) return { ok: true, resp };
-      lastErr = new Error(`HTTP ${resp?.status()} ${resp?.statusText()}`);
-    } catch (err) {
-      lastErr = err;
-      console.log(`[goto] failed: ${err}`);
+async function saveNote(name, message) {
+  const html = `<!doctype html><meta charset="utf-8">
+<title>${name}</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans JP","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif; line-height:1.6; margin:40px;}
+.card{max-width:760px;border-radius:12px;border:1px solid #e5e7eb;padding:24px;box-shadow:0 2px 12px rgba(0,0,0,.06);}
+h1{margin:0 0 12px 0;font-size:22px}
+.code{background:#111;color:#fff;padding:10px;border-radius:8px;white-space:pre-wrap}
+small{color:#6b7280}
+</style>
+<div class="card">
+<h1>entry skipped</h1>
+<p>DNS/接続の事情によりエントリーページへ到達できませんでした。</p>
+<div class="code">${message}</div>
+<small>このメモは監視の継続性のために自動生成されています。</small>
+</div>`;
+  await saveHtml(name, html);
+}
+
+async function saveShot(page, name) {
+  await ensureOut();
+  await page.screenshot({
+    path: path.join(OUT_DIR, `${name}.png`),
+    fullPage: true,
+  });
+  await saveHtml(name, await page.content());
+}
+
+async function gotoWithRetry(page, urls, saveName) {
+  for (const url of urls) {
+    for (let i = 1; i <= 3; i++) {
+      try {
+        console.log(`[goto] ${url} (${i}/3)`);
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
+        await page.waitForSelector("body", { timeout: 12000 }).catch(()=>{});
+        await sleep(500); // 落ち着かせる
+        await saveShot(page, saveName);
+        return true;
+      } catch (err) {
+        console.log(`[goto] failed: ${err}`);
+        // DNS 系は早めに次の候補へ
+        if ((err?.message || "").includes("ERR_NAME_NOT_RESOLVED")) break;
+        await sleep(1000);
+      }
     }
-    await page.waitForTimeout(1000);
   }
-  return { ok: false, err: lastErr };
+  return false;
 }
 
 async function main() {
-  console.log(`[monitor] Using Chrome at: ${CHROME}`);
+  const executablePath =
+    process.env.CHROME_BIN ||
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    "/usr/bin/google-chrome";
+  console.log("[monitor] Using Chrome at:", executablePath);
 
   const browser = await puppeteer.launch({
-    executablePath: CHROME,
     headless: "new",
+    executablePath,
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--hide-scrollbars",
+      "--window-size=1440,2500",
     ],
-    defaultViewport: { width: 1200, height: 2400, deviceScaleFactor: 2 },
   });
 
-  let exitCode = 0;
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1240, height: 2000, deviceScaleFactor: 2 });
 
-  try {
-    const entryUrls = [
-      "https://www.jkktokyo.or.jp/",
-      "https://jkk-tokyo.or.jp/",
-      "https://www.jkk-tokyo.or.jp/",
-    ];
-
-    const page = await browser.newPage();
-
-    // 1) エントリへトライ
-    let reached = false;
-    let lastErr;
-    for (const url of entryUrls) {
-      const r = await gotoWithRetry(page, url, 3);
-      if (r.ok) {
-        // 到達できたら HTML/スクショを保存して終了
-        const html = await page.content();
-        await saveHtmlPng("entry_referer", html, page);
-        reached = true;
-        break;
-      } else {
-        lastErr = r.err;
-      }
-    }
-
-    // 2) だめなら「entry_skipped」カードを別タブで描画して保存（ここで失敗しても job は成功にする）
-    if (!reached) {
-      const note = await browser.newPage(); // 既存 page はナビゲーション状態の可能性があるので新規
-      const msg = esc(lastErr?.message || lastErr || "Unknown error");
-      const html = `<!doctype html>
-<html lang="ja"><meta charset="utf-8">
-<title>entry skipped</title>
-<style>
-  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans JP",sans-serif;background:#f6f7f9;margin:0;padding:48px}
-  .card{max-width:720px;margin:40px auto;background:#fff;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.07);padding:28px 32px}
-  h1{margin:0 0 10px;font-size:24px}
-  code{background:#f1f3f5;border-radius:6px;padding:.2em .4em}
-  .muted{color:#667085;font-size:14px}
-</style>
-<div class="card">
-  <h1>entry skipped</h1>
-  <p class="muted">DNS/ネットワークで到達できなかったため、入口ページをスキップしました。</p>
-  <p>last error:</p>
-  <pre style="white-space:pre-wrap;word-break:break-word">${msg}</pre>
-  <p class="muted">この状態は一時的なことがあるので、再実行すれば通る場合があります。</p>
-</div>`;
-      await note.setContent(html, { waitUntil: "domcontentloaded" });
-      await saveHtmlPng("entry_referer_skipped", html, note);
-      await note.close();
-      console.log("[note] entry skipped; job will succeed.");
-      exitCode = 0; // ここは成功扱い
-    }
-
-  } catch (e) {
-    // 予期せぬ例外は final_error として保存（それでも落としたいなら exitCode=1）
-    console.log("[note] unexpected error:", e);
-    try {
-      const page = await browser.newPage();
-      const html = `<!doctype html><meta charset="utf-8"><title>final error</title>
-      <pre>${esc(String(e))}</pre>`;
-      await page.setContent(html, { waitUntil: "domcontentloaded" });
-      await saveHtmlPng("final_error", html, page);
-      await page.close();
-    } catch {}
-    exitCode = 1;
-  } finally {
-    await browser.close();
-    process.exitCode = exitCode;
+  // 1) JKK トップ（候補 URL を順番に試す）
+  const entryUrls = [
+    "https://www.jkktokyo.or.jp/",
+    "https://jkktokyo.or.jp/",
+    "https://www.jkk-tokyo.or.jp/",
+    "https://jkk-tokyo.or.jp/",
+  ];
+  const entryOk = await gotoWithRetry(page, entryUrls, "entry_referer");
+  if (!entryOk) {
+    await saveNote(
+      "entry_referer_skipped",
+      `URL: ${entryUrls[0]}\nlast error:\nnet::ERR_NAME_NOT_RESOLVED など`
+    );
   }
+
+  // 2) 検索系（到達できれば保存、ダメならメモ）
+  const resultUrls = [
+    "https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp",
+  ];
+  try {
+    const got = await gotoWithRetry(page, resultUrls, "after_wait");
+    if (!got) {
+      await saveNote(
+        "result_or_form",
+        "検索フォーム/結果はブロックまたは到達不可でした。"
+      );
+    }
+  } catch (e) {
+    await saveNote("final_error", String(e?.stack || e));
+  }
+
+  await browser.close();
 }
 
-await main();
+main().catch(async (e) => {
+  console.error(e);
+  try {
+    await saveNote("final_error", String(e?.stack || e));
+  } catch {}
+  process.exitCode = 1;
+});
