@@ -1,5 +1,5 @@
 // monitor.mjs — JKKトライ（入口は任意扱い, DNS失敗でも継続）
-// 2025-10 修正版
+// 2025-10 修正版 v2
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,9 +53,7 @@ async function gotoWithRetry(page, url, label, tries = 3) {
       console.log(`[goto] ${label}: OK (${i}/${tries})`);
       return;
     } catch (e) {
-      console.warn(
-        `[goto] ${label}: ${e?.message || e} (${i}/${tries})`
-      );
+      console.warn(`[goto] ${label}: ${e?.message || e} (${i}/${tries})`);
       if (i === tries) throw e;
       await sleep(1200);
     }
@@ -64,6 +62,8 @@ async function gotoWithRetry(page, url, label, tries = 3) {
 
 // Chromeでブロックされた場合の退避：Node fetch→<base>付与で描画
 async function fetchToPage(page, url) {
+  // 念のため pending ナビゲーションと競合しないよう blank に寄せる
+  try { await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 }); } catch {}
   const res = await fetch(url, { redirect: "follow" });
   const body = await res.text();
   const safe = body
@@ -79,7 +79,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     executablePath: CHROME,
-    headless: "new",                       // ← 新Headlessで安定
+    headless: "new",
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
@@ -110,10 +110,16 @@ async function main() {
       await save(page, "entry_referer");
     } catch (e) {
       console.warn(`[entry-skipped] ${e?.message || e}`);
-      await page.setContent(
-        `<!doctype html><meta charset="utf-8"><h2>entry skipped</h2><p>${(e?.message||"")}</p>`
+      // ←★ ここを別タブで保存するように変更（競合回避）
+      const p2 = await browser.newPage();
+      await p2.setViewport({ width: 1280, height: 800 });
+      await p2.setContent(
+        `<!doctype html><meta charset="utf-8">
+         <h2 style="font-family:sans-serif">entry skipped</h2>
+         <p>${(e?.message||"")}</p>`
       );
-      await save(page, "entry_referer_skipped"); // 証跡だけ残す
+      await save(p2, "entry_referer_skipped");
+      await p2.close();
     }
 
     // 2) 候補URLを順に試す。Chromeブロックなら fetch 描画に切替
