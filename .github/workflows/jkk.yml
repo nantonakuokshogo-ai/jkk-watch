@@ -1,29 +1,33 @@
 name: jkk-watch
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:    # 手動実行
   schedule:
-    - cron: "0 * * * *" # 毎時0分に実行（お好みで）
+    - cron: "0 * * * *" # 任意。毎時0分
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      # 安定版の Chromium を用意
+      # Chrome を入れる（出力を使うので id を必ず付ける）
       - name: Setup Chrome
+        id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
       - name: Show Chrome path
-        run: echo "Chrome: ${{ steps.chrome.outputs.chrome-path }}"
+        run: |
+          echo "CHROME_PATH(from env) = $CHROME_PATH"
+          echo "chrome-path(output)  = ${{ steps.chrome.outputs.chrome-path }}"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Install deps
         run: npm install --no-audit --no-fund
@@ -31,8 +35,8 @@ jobs:
       - name: Run monitor
         run: npm run monitor
         env:
-          # browser-actions/setup-chrome が設定したパスを最優先
-          PUPPETEER_EXECUTABLE_PATH: ${{ env.CHROME_PATH }}
+          # Puppeteer に Chrome の実行ファイルを確実に渡す
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
       - name: Upload artifacts
         if: always()
