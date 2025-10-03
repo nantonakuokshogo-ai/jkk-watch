@@ -1,47 +1,36 @@
 name: jkk-watch
 
 on:
-  workflow_dispatch:    # 手動実行
+  workflow_dispatch:
   schedule:
-    - cron: "0 * * * *" # 任意。毎時0分
+    - cron: "0 * * * *" # 毎時（必要なら調整）
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # Chrome を入れる（出力を使うので id を必ず付ける）
-      - name: Setup Chrome
-        id: chrome
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Show Chrome path
-        run: |
-          echo "CHROME_PATH(from env) = $CHROME_PATH"
-          echo "chrome-path(output)  = ${{ steps.chrome.outputs.chrome-path }}"
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Install deps
-        run: npm install --no-audit --no-fund
+        run: |
+          npm ci --ignore-scripts || npm i --no-audit --no-fund --ignore-scripts
 
       - name: Run monitor
         run: npm run monitor
-        env:
-          # Puppeteer に Chrome の実行ファイルを確実に渡す
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
-      - name: Upload artifacts
+      - name: Upload out
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-watch-out
+          name: out
           path: out/**
-          if-no-files-found: warn
+        
