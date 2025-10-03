@@ -1,6 +1,6 @@
-// monitor.mjs — 旧Puppeteer互換の「同タブ矯正」版
+// monitor.mjs — 直接 wait.jsp へ行く堅牢版（DNS/ブロックに強いリトライ付き）
 // 実行: node monitor.mjs
-// 生成: out/entry_referer.*, out/after_wait.*, out/result_or_form_*.*
+// 生成: out/after_wait.*, out/result_or_form_*.*
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -28,14 +28,49 @@ function chromePath(){
     || "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome";
 }
 
-// addInitScript が無い旧版でも動くようにフォールバック
+// addInitScript の旧版互換（evaluateOnNewDocument にフォールバック）
 async function addInit(page, fn){
   if (typeof page.addInitScript === "function") {
     await page.addInitScript(fn);
   } else {
-    // 旧名称：evaluateOnNewDocument
     await page.evaluateOnNewDocument(fn);
   }
+}
+
+// ネットワーク周りを強めにした遷移
+async function gotoWithRetries(page, url, opts = {}){
+  const tries = [];
+  const u = new URL(url);
+
+  // 1) そのまま https
+  tries.push(()=>page.goto(u.toString(), opts));
+
+  // 2) 一時バッファ等で弾かれた時用にキャッシュバスター
+  tries.push(()=>{
+    const u2 = new URL(u.toString());
+    u2.searchParams.set("_t", Date.now().toString());
+    return page.goto(u2.toString(), opts);
+  });
+
+  // 3) どうしても名前解決やTLSでこける時は http にフォールバック
+  if (u.protocol === "https:") {
+    const httpURL = new URL(u.toString());
+    httpURL.protocol = "http:";
+    tries.push(()=>page.goto(httpURL.toString(), opts));
+  }
+
+  let lastErr;
+  for (let i=0;i<tries.length;i++){
+    try {
+      return await tries[i]();
+    } catch (e) {
+      lastErr = e;
+      const msg = (e && e.message) || "";
+      console.warn(`[goto retry ${i+1}/${tries.length}] ${u} -> ${msg}`);
+      await sleep(1500);
+    }
+  }
+  throw lastErr;
 }
 
 async function main(){
@@ -60,18 +95,18 @@ async function main(){
 
   const page = await browser.newPage();
 
-  // 同タブ矯正（旧版でも効くように evaluateOnNewDocument フォールバック）
+  // すべての新規ドキュメントで「同タブ強制」を仕込む
   await addInit(page, () => {
     try { window.name = "JKKnet"; } catch(e){}
     const originalOpen = window.open;
     window.open = function(url){
-      if (url) location.href = url; // 同タブ遷移へ強制
+      if (url) location.href = url; // 同タブに矯正
       return window;
     };
-    window.close = function(){};   // 元タブ close 無効化
+    window.close = function(){}; // 元タブ close を無力化
   });
 
-  // 参考ログ
+  // 雑多なログ
   page.on("requestfailed", (req)=>{
     const f = req.failure && req.failure();
     if (f && /blocked_by_client/i.test(f.errorText||"")) {
@@ -83,26 +118,30 @@ async function main(){
   page.on("popup", async p=>{ try{ await p.close({ runBeforeUnload:false }); }catch{} });
 
   try{
-    // 1) トップ → リファラ作成
-    await page.goto("https://www.jkktokyo.or.jp/", {
+    // ここでトップへは行かない（DNS で落ちやすい）。Referer は手で付ける。
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+    );
+    await page.setExtraHTTPHeaders({
+      Referer: "https://www.jkktokyo.or.jp/",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "same-site",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Dest": "document",
+    });
+
+    // 1) 直接 wait.jsp へ（リトライ付き）
+    await gotoWithRetries(page, "https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp", {
       waitUntil: "domcontentloaded", timeout: 60_000
     });
-    await sleep(1000);
-    await save(page, "entry_referer");
 
-    // 2) Referer を明示して中継 wait.jsp へ
-    await page.setExtraHTTPHeaders({ Referer: "https://www.jkktokyo.or.jp/" });
-    await page.goto("https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp", {
-      waitUntil: "domcontentloaded", timeout: 60_000
-    });
-
-    // onload→window.open→POST→遷移 を待つ（ネットワーク事情に強めに待機）
+    // onload→window.open→POST→遷移 を厚めに待つ
     await sleep(4000);
-    await page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(()=>{});
+    await page.waitForNavigation({ waitUntil: "load", timeout: 25_000 }).catch(()=>{});
     await sleep(1000);
     await save(page, "after_wait");
 
-    // 3) 到達先の軽判定
+    // 2) 軽判定と記録
     const kind = await page.evaluate(()=>{
       if (document.querySelector("frame, frameset")) return "frames";
       const hasSearch = [...document.querySelectorAll("input,button")]
@@ -114,7 +153,7 @@ async function main(){
     await save(page, `result_or_form_${kind}`);
   }catch(err){
     console.error(err);
-    await save(page, "final_error").catch(()=>{});
+    try { await save(page, "final_error"); } catch(_){}
     process.exitCode = 1;
   }finally{
     await browser.close().catch(()=>{});
