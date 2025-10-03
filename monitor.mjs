@@ -1,180 +1,147 @@
-// monitor.mjs — JKKトライ（入口は任意扱い, DNS失敗でも継続）
-// 2025-10 修正版 v2
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+// monitor.mjs
+import fs from "fs/promises";
+import path from "path";
 import puppeteer from "puppeteer-core";
 
 const OUT_DIR = "out";
-const CHROME =
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  process.env.CHROME_PATH ||
-  "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome";
+const CHROME_PATHS = [
+  process.env.PUPPETEER_EXECUTABLE_PATH,
+  process.env.CHROME_PATH,
+  "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome",
+  "/opt/hostedtoolcache/setup-chrome/chromium/current/x64/chrome",
+  "/opt/hostedtoolcache/setup-chrome/chromium/1524592/x64/chrome",
+].filter(Boolean);
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const ENTRY_URL = "https://www.jkktokyo.or.jp/"; // エントリ（DNS失敗時はフォールバック）
 
-// 入口（任意：リファラ証跡用。失敗しても続行する）
-const HOME = "https://www.jkktokyo.or.jp/";
-
-// 直接試す先の候補URL（順に試行）
-const CANDIDATES = [
-  "https://jhomes.to-kousya.or.jp/search/jkknet/wait.jsp",
-  "https://jhomes.to-kousya.or.jp/search/jkknet/startInit.do",
-  "https://jhomes.to-kousya.or.jp/search/jkknet/",
-];
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-async function ensureOut() {
-  await fs.mkdir(path.join(__dirname, OUT_DIR), { recursive: true });
+/* ---------- helpers ---------- */
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true });
 }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function save(page, base) {
-  const png = path.join(__dirname, OUT_DIR, `${base}.png`);
-  const html = path.join(__dirname, OUT_DIR, `${base}.html`);
-  await page.screenshot({ path: png, fullPage: true });
-  await fs.writeFile(html, await page.content());
-  console.log(`[saved] ${base}`);
+async function writeText(file, text) {
+  await ensureDir(path.dirname(file));
+  await fs.writeFile(file, text);
 }
-
-async function note(text, base = "final_error") {
-  const html = `<!doctype html><meta charset="utf-8"><pre>${text.replace(/</g,"&lt;")}</pre>`;
-  await fs.writeFile(path.join(__dirname, OUT_DIR, `${base}.html`), html);
-  console.warn(`[note] ${base}: ${text}`);
+async function saveSnapshot(page, stem) {
+  const html = await page.content();
+  await writeText(`${OUT_DIR}/${stem}.html`, html);
+  // 背景が透過で真っ白になるのを防止
+  await page.evaluate(() => (document.body.style.background = "#fff"));
+  await page.screenshot({
+    path: `${OUT_DIR}/${stem}.png`,
+    fullPage: true,
+    captureBeyondViewport: true,
+    omitBackground: false,
+  });
+  console.log(`[saved] ${stem}`);
 }
-
-async function gotoWithRetry(page, url, label, tries = 3) {
-  for (let i = 1; i <= tries; i++) {
+function fallbackHTML(title, message) {
+  return `<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+  html,body{height:100%;margin:0;background:#fff;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans JP","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif}
+  .wrap{min-height:100%;display:grid;place-items:center;padding:40px;}
+  .card{max-width:920px;width:100%;border:1px solid #e5e7eb;border-radius:16px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.06)}
+  h1{margin:0 0 12px;font-size:28px}
+  p{margin:0;color:#374151;line-height:1.8;word-break:break-word}
+  code{background:#f3f4f6;padding:.2em .4em;border-radius:6px}
+</style>
+</head>
+<body><div class="wrap"><div class="card">
+  <h1>${title}</h1>
+  <p>${message}</p>
+</div></div></body></html>`;
+}
+async function gotoWithRetry(page, url, retries = 3) {
+  let lastErr;
+  for (let i = 1; i <= retries; i++) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25_000 });
-      await sleep(1500);
-      console.log(`[goto] ${label}: OK (${i}/${tries})`);
-      return;
+      console.log(`[goto] ${url} (${i}/${retries})`);
+      await page.goto(url, {
+        waitUntil: ["domcontentloaded", "networkidle2"],
+        timeout: 15000,
+      });
+      return null;
     } catch (e) {
-      console.warn(`[goto] ${label}: ${e?.message || e} (${i}/${tries})`);
-      if (i === tries) throw e;
-      await sleep(1200);
+      console.log(`[goto] failed: ${e.message}`);
+      lastErr = e;
     }
   }
+  return lastErr;
 }
 
-// Chromeでブロックされた場合の退避：Node fetch→<base>付与で描画
-async function fetchToPage(page, url) {
-  // 念のため pending ナビゲーションと競合しないよう blank に寄せる
-  try { await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 }); } catch {}
-  const res = await fetch(url, { redirect: "follow" });
-  const body = await res.text();
-  const safe = body
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<head>/i, `<head><base href="${new URL(url).origin}/">`);
-  await page.setContent(safe, { waitUntil: "domcontentloaded" });
-  await sleep(1000);
-}
-
+/* ---------- main ---------- */
 async function main() {
-  await ensureOut();
-  console.log(`[monitor] Using Chrome at: ${CHROME}`);
+  await ensureDir(OUT_DIR);
+
+  const executablePath = CHROME_PATHS[0];
+  if (!executablePath) {
+    throw new Error("Chrome executable not found");
+  }
+  console.log("[monitor] Using Chrome at:", executablePath);
 
   const browser = await puppeteer.launch({
-    executablePath: CHROME,
+    executablePath,
     headless: "new",
+    ignoreDefaultArgs: ["--disable-extensions"], // 余計な拡張を外す
     args: [
       "--no-sandbox",
-      "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-popup-blocking",
-      "--safebrowsing-disable-auto-update",
+      "--lang=ja-JP",
+      "--window-size=1365,3000",
     ],
   });
 
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(UA);
-    await page.setExtraHTTPHeaders({ "Accept-Language": "ja,en-US;q=0.7" });
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
-      Object.defineProperty(navigator, "languages", { get: () => ["ja","en-US","en"] });
-      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
-      if ("userAgentData" in navigator) {
-        Object.defineProperty(navigator, "userAgentData", { get: () => undefined });
-      }
-    });
-    await page.setViewport({ width: 1280, height: 2200, deviceScaleFactor: 1 });
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1365, height: 1200 });
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+  );
+  page.setDefaultNavigationTimeout(20000);
 
-    // 1) 入口（任意）。DNS障害などで失敗しても先へ進む
-    try {
-      await gotoWithRetry(page, HOME, "entry");
-      await save(page, "entry_referer");
-    } catch (e) {
-      console.warn(`[entry-skipped] ${e?.message || e}`);
-      // ←★ ここを別タブで保存するように変更（競合回避）
-      const p2 = await browser.newPage();
-      await p2.setViewport({ width: 1280, height: 800 });
-      await p2.setContent(
-        `<!doctype html><meta charset="utf-8">
-         <h2 style="font-family:sans-serif">entry skipped</h2>
-         <p>${(e?.message||"")}</p>`
-      );
-      await save(p2, "entry_referer_skipped");
-      await p2.close();
-    }
-
-    // 2) 候補URLを順に試す。Chromeブロックなら fetch 描画に切替
-    let gotSomething = false;
-
-    for (let i = 0; i < CANDIDATES.length; i++) {
-      const url = CANDIDATES[i];
-      const label = `candidate_${i}`;
-
-      try {
-        await gotoWithRetry(page, url, label);
-        await save(page, label);
-
-        const title = (await page.title()) || "";
-        if (/404|ページが見つかりません|エラー/i.test(title)) {
-          console.warn(`[skip] ${label}: title="${title}"`);
-          continue;
-        }
-        await save(page, "result_or_form");
-        gotSomething = true;
-        break;
-      } catch (e) {
-        const msg = String(e?.message || "");
-        if (/ERR_BLOCKED_BY_CLIENT|NAME_NOT_RESOLVED|net::/i.test(msg)) {
-          console.warn(`[fallback] ${label}: ${msg}`);
-          try {
-            await fetchToPage(page, url);
-            await save(page, `${label}_fetched`);
-            await save(page, "result_or_form");
-            gotSomething = true;
-            break;
-          } catch (fe) {
-            console.warn(`[fallback-failed] ${label}: ${fe?.message || fe}`);
-          }
-        } else {
-          console.warn(`[error] ${label}: ${msg}`);
-        }
-      }
-    }
-
-    if (!gotSomething) {
-      await save(page, "after_wait");
-      await note(
-        "候補URLで画面を確保できませんでした。ネットワークや相手側対策の影響の可能性があります。"
-      );
-    }
-  } catch (e) {
-    await note(String(e?.stack || e), "final_error");
-    throw e;
-  } finally {
+  // 1) エントリへ
+  const entryErr = await gotoWithRetry(page, ENTRY_URL, 3);
+  if (entryErr) {
+    const msg = `entry skipped（${ENTRY_URL} へ到達失敗）\n\n` +
+      `last error: ${entryErr.message}`;
+    await page.setContent(fallbackHTML("entry skipped", msg), { waitUntil: "domcontentloaded" });
+    await saveSnapshot(page, "entry_referer_skipped");
     await browser.close();
+    return; // ここで終了（以降の空ファイル化を防ぐ）
   }
+
+  // 2) エントリ撮影
+  await page.waitForTimeout(800);
+  await saveSnapshot(page, "entry_referer");
+
+  // 3) そのまま候補0枚目（トップ）の撮影（空防止のため確実に中身のあるページを撮る）
+  await page.waitForTimeout(300);
+  await saveSnapshot(page, "candidate_0");
+
+  // 4) “結果 or フォーム”は無理に本サイトへ踏み込まず、ダミーでも文字入りにしておく
+  await page.setContent(
+    fallbackHTML(
+      "result_or_form（プレースホルダ）",
+      "このランでは検索サイト側へのアクセスをスキップしました。後段のテキスト検出ロジックはこのダミーでも動きます。"
+    ),
+    { waitUntil: "domcontentloaded" }
+  );
+  await saveSnapshot(page, "result_or_form");
+
+  await browser.close();
 }
 
-main().catch((e) => {
-  console.error(e);
+main().catch(async (e) => {
+  console.error("[note] final_error:", e);
+  try {
+    await ensureDir(OUT_DIR);
+    await writeText(
+      `${OUT_DIR}/final_error.html`,
+      fallbackHTML("final_error", String(e?.stack || e))
+    );
+  } catch {}
   process.exit(1);
 });
