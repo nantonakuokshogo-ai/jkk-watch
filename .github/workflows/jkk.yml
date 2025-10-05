@@ -1,11 +1,158 @@
-name: jkk-kosha-search (smoke)
+name: jkk-kosha-search
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'フリーワード（未指定なら「コーシャハイム」）'
+        required: false
+        default: 'コーシャハイム'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-kosha-search
+  cancel-in-progress: true
 
 jobs:
-  ping:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Hello
-        run: echo "Actions is alive"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20 (no cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 必要ファイルが無ければ生成（あれば何もしません）
+      - name: Ensure runtime files (create if missing)
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            cat > package.json <<'JSON'
+{
+  "name": "jkk-kosha-search",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "start": "node jkk_search_kosha.mjs" },
+  "dependencies": { "playwright": "^1.45.0" }
+}
+JSON
+          fi
+
+          if [ ! -f jkk_search_kosha.mjs ]; then
+            cat > jkk_search_kosha.mjs <<'JS'
+import { chromium } from "playwright";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+const BASE = "https://jhomes.to-kousya.or.jp/";
+const KEYWORD = process.env.JKK_KEYWORD || "コーシャハイム";
+const OUTDIR = "out";
+
+async function ensureOut(){ await fs.mkdir(OUTDIR,{recursive:true}); }
+async function saveShot(p,n){ await p.screenshot({ path: path.join(OUTDIR, n+".png"), fullPage: true }); }
+async function saveHTML(p,n){ const h=await p.content(); await fs.writeFile(path.join(OUTDIR, n+".html"), h, "utf-8"); }
+
+async function gotoEntry(page){
+  const res = await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 45000 });
+  if (!res) throw new Error("初期アクセスに失敗しました");
+  await page.waitForLoadState("domcontentloaded");
+}
+
+async function findFreewordAndSearch(page, kw){
+  const sels=['input[name*="free"]','input[id*="free"]','input[placeholder*="ワード"]','input[placeholder*="フリー"]','input[type="text"]'];
+  let found=null;
+  for(const s of sels){ const c=page.locator(s).first(); if(await c.count() && await c.isVisible().catch(()=>false)){ found=c; break; } }
+  if(!found){
+    for(const t of ["空き家","検索","さがす","住まい"]){
+      const l=page.getByRole("link",{name:new RegExp(t)}).first();
+      if(await l.count()){ await Promise.all([page.waitForLoadState("domcontentloaded"), l.click() ]); break; }
+    }
+    for(const s of sels){ const c=page.locator(s).first(); if(await c.count() && await c.isVisible().catch(()=>false)){ found=c; break; } }
+  }
+  if(!found) throw new Error("フリーワード入力欄が見つかりませんでした。");
+  await found.fill(""); await found.type(kw,{delay:10});
+  for(const s of ['button[type="submit"]','input[type="submit"]','button:has-text("検索")','a:has-text("検索")','button:has-text("さがす")','input[value*="検索"]']){
+    const b=page.locator(s).first();
+    if(await b.count() && await b.isVisible().catch(()=>false)){ await Promise.all([page.waitForLoadState("domcontentloaded"), b.click() ]); return; }
+  }
+  await found.press("Enter"); await page.waitForLoadState("domcontentloaded");
+}
+
+async function extractResults(page){
+  const data = await page.evaluate(()=>{
+    const rows=[]; const seen=new Set();
+    const links=[...document.querySelectorAll('a[onclick*="senPage"], a[href*="detail"], a[href*="result"], a[href*="Ref"]')];
+    for(const a of links){
+      const name=(a.textContent||"").trim();
+      const href=a.getAttribute("href")||"";
+      const onclick=a.getAttribute("onclick")||"";
+      const key=name+"|"+href+"|"+onclick; if(seen.has(key)) continue; seen.add(key);
+      const parent=a.closest("tr, .resultItem, .listItem, .housingList, li, div");
+      const snip=(parent?parent.textContent:a.textContent||"").replace(/\s+/g," ").trim().slice(0,300);
+      rows.push({name, href, onclick, snippet: snip});
+    }
+    return rows.filter(r=>r.name||r.href||r.onclick);
+  });
+  const abs=(u)=>{ try{ return new URL(u,"https://jhomes.to-kousya.or.jp/").toString(); }catch{ return null; } };
+  return data.map(r=>{
+    const id=(r.onclick && /senPage\(([^)]+)\)/.exec(r.onclick))?.[1] || null;
+    return { title: r.name || null, detail_url: r.href ? abs(r.href) : null, listing_id: id, snippet: r.snippet };
+  });
+}
+
+function toCSV(rows){
+  if(!rows.length) return "title,detail_url,listing_id,snippet\n";
+  const head=Object.keys(rows[0]);
+  const esc=v=>{ const s=String(v??""); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s; };
+  return [head.join(","), ...rows.map(r=>head.map(k=>esc(r[k])).join(","))].join("\n")+"\n";
+}
+
+async function main(){
+  await ensureOut();
+  const browser=await chromium.launch({ headless:true, args: process.env.CI?["--no-sandbox","--disable-dev-shm-usage"]:[] });
+  const ctx=await browser.newContext({ locale:"ja-JP", timezoneId:"Asia/Tokyo" });
+  const page=await ctx.newPage(); page.setDefaultTimeout(30000);
+  const z=n=>String(n).padStart(2,"0"); const d=new Date(); const tag=`kosha_${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
+  try{
+    await gotoEntry(page); await saveShot(page,`${tag}_01_entry`); await saveHTML(page,`${tag}_01_entry`);
+    await findFreewordAndSearch(page, process.env.JKK_KEYWORD || "コーシャハイム");
+    await page.waitForLoadState("domcontentloaded"); await saveShot(page,`${tag}_02_result`); await saveHTML(page,`${tag}_02_result`);
+    const items=await extractResults(page);
+    await fs.writeFile(path.join(OUTDIR, `${tag}_items.json`), JSON.stringify({ keyword: process.env.JKK_KEYWORD || "コーシャハイム", items }, null, 2));
+    await fs.writeFile(path.join(OUTDIR, `${tag}_items.csv`), toCSV(items));
+  }catch(e){
+    console.error("[JKK] 失敗:", e?.message||e);
+    await saveShot(page,`${tag}_err`); await saveHTML(page,`${tag}_err`);
+    process.exitCode=1;
+  }finally{ await browser.close(); }
+}
+main();
+JS
+          fi
+
+      - name: Install Playwright
+        run: |
+          npm ci || npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run kosha search
+        env:
+          CI: "true"
+          JKK_KEYWORD: ${{ github.event.inputs.keyword || 'コーシャハイム' }}
+        run: node jkk_search_kosha.mjs
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jkk-out-${{ github.run_id }}
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 14
