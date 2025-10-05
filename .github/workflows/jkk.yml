@@ -1,10 +1,35 @@
-      - name: Sanity check (list files)
-        run: |
-          pwd
-          ls -la
-          echo "--- files (depth 2) ---"
-          find . -maxdepth 2 -type f | sort
+name: jkk-kosha-search
 
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'フリーワード（未指定なら「コーシャハイム」）'
+        required: false
+        default: 'コーシャハイム'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-kosha-search
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (no cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ← ここで package.json と jkk_search_kosha.mjs を作ります（無ければ）
       - name: Ensure runtime files (create if missing)
         run: |
           if [ ! -f package.json ]; then
@@ -13,12 +38,8 @@
   "name": "jkk-kosha-search",
   "version": "0.1.0",
   "type": "module",
-  "scripts": {
-    "start": "node jkk_search_kosha.mjs"
-  },
-  "dependencies": {
-    "playwright": "^1.45.0"
-  }
+  "scripts": { "start": "node jkk_search_kosha.mjs" },
+  "dependencies": { "playwright": "^1.45.0" }
 }
 JSON
           fi
@@ -36,12 +57,10 @@ const KEYWORD = process.env.JKK_KEYWORD || "コーシャハイム";
 const OUTDIR = "out";
 
 async function ensureOut() { await fs.mkdir(OUTDIR, { recursive: true }); }
-function stamp() {
-  const z=(n)=>String(n).padStart(2,"0"); const d=new Date();
-  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
-}
-async function saveShot(page, name){ await page.screenshot({ path: path.join(OUTDIR, `${name}.png`), fullPage: true }); }
-async function saveHTML(page, name){ const html = await page.content(); await fs.writeFile(path.join(OUTDIR, `${name}.html`), html, "utf-8"); }
+function stamp(){ const z=n=>String(n).padStart(2,"0"); const d=new Date();
+  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`; }
+async function saveShot(p, name){ await p.screenshot({ path: path.join(OUTDIR, `${name}.png`), fullPage: true }); }
+async function saveHTML(p, name){ const html = await p.content(); await fs.writeFile(path.join(OUTDIR, `${name}.html`), html, "utf-8"); }
 
 async function gotoEntry(page){
   const res = await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -142,7 +161,7 @@ async function main() {
     userAgent:"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" });
   const page = await ctx.newPage(); page.setDefaultTimeout(30000);
 
-  const z= (n)=>String(n).padStart(2,"0"); const d=new Date();
+  const z=(n)=>String(n).padStart(2,"0"); const d=new Date();
   const tag = `kosha_${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
 
   try {
@@ -186,3 +205,23 @@ async function main() {
 main();
 JS
           fi
+
+      - name: Install dependencies
+        run: |
+          npm ci || npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run kosha search
+        env:
+          CI: "true"
+          JKK_KEYWORD: ${{ github.event.inputs.keyword || 'コーシャハイム' }}
+        run: node jkk_search_kosha.mjs
+
+      - name: Upload artifacts (out/)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jkk-out-${{ github.run_id }}
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 14
