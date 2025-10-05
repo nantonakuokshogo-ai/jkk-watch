@@ -1,12 +1,11 @@
 {
-  "name": "jkk-monitor",
-  "version": "0.2.0",
+  "name": "jkk-kosha-search",
+  "version": "0.1.0",
   "type": "module",
-  "private": true,
   "scripts": {
-    "monitor": "node monitor.mjs"
+    "start": "node jkk_search_kosha.mjs"
   },
   "dependencies": {
-    "puppeteer": "^22.13.1"
+    "playwright": "^1.45.0"
   }
 }
