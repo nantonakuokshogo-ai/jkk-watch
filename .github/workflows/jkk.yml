@@ -1,35 +1,22 @@
-name: jkk-watch
+# .github/workflows/monitor.yml
+name: JKK Monitor
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *" # 毎時0分（好みで調整OK）
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
-      # Chrome を用意（出力に chrome-path が入ります）
-      - uses: browser-actions/setup-chrome@v1
-        id: chrome
-
-      - name: Install
-        run: npm i --no-fund --no-audit
-
-      - name: Monitor
+          node-version: 20
+      - run: npm install
+      - run: node monitor.mjs
         env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run monitor
-
-      - name: Upload
-        if: always()
-        uses: actions/upload-artifact@v4
+          JKK_TOP_URL: ${{ secrets.JKK_TOP_URL }} # 任意。未設定なら www を使う
+      - uses: actions/upload-artifact@v4
         with:
-          name: out
-          path: out/**
+          name: jkk-out
+          path: out/
