@@ -24,23 +24,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node (no cache)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install dependencies
         run: |
-          # lockfile が無い場合にも対応
           npm ci || npm install
-          # Playwright本体とUbuntu依存をインストール
           npx playwright install --with-deps chromium
 
       - name: Run kosha search
         env:
           CI: "true"
-          # workflow_dispatch の入力が無い場合は既定値に
           JKK_KEYWORD: ${{ github.event.inputs.keyword || 'コーシャハイム' }}
         run: node jkk_search_kosha.mjs
 
