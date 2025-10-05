@@ -5,21 +5,59 @@ import puppeteer from "puppeteer";
 
 const OUT = path.resolve("out");
 const S = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 入口の候補（www 付きを優先）
 const TOP_CANDIDATES = [
   process.env.JKK_TOP_URL?.trim(),
-  "https://www.jkk-tokyo.or.jp/", // こちらを最優先（www 付き）
-  "https://jkk-tokyo.or.jp/",     // 補助（失敗しがち）
+  "https://www.jkk-tokyo.or.jp/",
+  "https://jkk-tokyo.or.jp/",
 ].filter(Boolean);
 
+// ------------------------ utils ------------------------
 async function ensureOut() {
   if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
 }
-async function saveShot(page, name) {
-  await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
+
+async function ensureViewport(page) {
+  if (!page || page.isClosed()) return;
+  try {
+    const vp = page.viewport();
+    const need =
+      !vp || !vp.width || !vp.height || vp.width < 320 || vp.height < 320;
+    if (need) {
+      await page.setViewport({ width: 1366, height: 960, deviceScaleFactor: 1 });
+    }
+    // 念のためウィンドウサイズも合わせる
+    await page.evaluate(() => {
+      try { window.resizeTo(1366, 960); } catch {}
+      document.body && (document.body.style.background = document.body.style.background || "#fff");
+    });
+  } catch {}
 }
+
+async function saveShot(page, name) {
+  try {
+    await ensureViewport(page);
+    await page.bringToFront().catch(() => {});
+    await page.screenshot({
+      path: path.join(OUT, `${name}.png`),
+      fullPage: true,
+      captureBeyondViewport: false,
+    });
+  } catch (e) {
+    // 失敗しても処理続行できるようにする（幅0対策の最終防衛）
+    fs.writeFileSync(path.join(OUT, `${name}_shot_error.txt`), String(e?.stack || e));
+  }
+}
+
 async function saveHTML(page, name) {
-  const html = await page.content();
-  fs.writeFileSync(path.join(OUT, `${name}.html`), html);
+  try {
+    await ensureViewport(page);
+    const html = await page.content();
+    fs.writeFileSync(path.join(OUT, `${name}.html`), html);
+  } catch (e) {
+    fs.writeFileSync(path.join(OUT, `${name}_html_error.txt`), String(e?.stack || e));
+  }
 }
 
 function writeEntrySkippedCard({ lastUrl, urlsTried, reason }) {
@@ -41,13 +79,15 @@ small{color:#666}
   fs.writeFileSync(path.join(OUT, "entry_referer_skipped.html"), html);
 }
 
+// ------------------------ navigation ------------------------
 async function gotoTop(page) {
   let lastErr = null;
   const tried = [];
   for (const url of TOP_CANDIDATES) {
     tried.push(url);
     try {
-      const res = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ensureViewport(page);
+      const res = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
       if (res && res.ok()) {
         await saveShot(page, "entry_referer");
         await saveHTML(page, "entry_referer");
@@ -66,107 +106,93 @@ async function gotoTop(page) {
 }
 
 async function findAndClickJkknet(page) {
-  // 1) 露出している「JKKねっと」リンクを探す
+  // 1) 「JKKねっと」っぽいリンクを広めに探索
   const selectorCandidates = [
     'a[href*="jkknet"]',
-    'a[href*="/search/"]',
+    'a[href*="/search"]',
     'a[href*="akiya"]',
+    'a:has-text("JKKねっと")',
+    'a:has-text("検索")',
   ];
 
   for (const sel of selectorCandidates) {
-    const el = await page.$(sel);
-    if (el) {
-      // 新規タブ抑止
-      await page.evaluate((s) => {
-        const a = document.querySelector(s);
-        if (a) a.removeAttribute("target");
-      }, sel);
+    const el = await page.$(sel).catch(() => null);
+    if (!el) continue;
 
-      // ポップアップ監視（中継ページが window.open(..., "JKKnet") を叩くため）
-      const popupTargetPromise = page.browser().waitForTarget(
+    // 新規タブ抑止
+    await page.evaluate((s) => {
+      const a = document.querySelector(s);
+      if (a) a.removeAttribute("target");
+    }, sel).catch(() => {});
+
+    // ポップアップ（wait.jsp / "JKKnet"）を監視
+    const popupTargetPromise = page.browser().waitForTarget(
+      (t) => {
+        const u = (t.url() || "").toLowerCase();
+        return u.includes("wait.jsp") || u.includes("jkknet");
+      },
+      { timeout: 15000 }
+    ).catch(() => null);
+
+    await saveShot(page, "pre_click");
+    await el.click({ delay: 60 }).catch(() => {});
+    await S(250);
+    await saveShot(page, "post_click");
+
+    // 子ターゲットを取得
+    let popupTarget = await popupTargetPromise;
+    if (!popupTarget) {
+      popupTarget = await page.browser().waitForTarget(
         (t) => {
           const u = (t.url() || "").toLowerCase();
           return u.includes("wait.jsp") || u.includes("jkknet");
         },
-        { timeout: 15000 }
+        { timeout: 10000 }
       ).catch(() => null);
-
-      await saveShot(page, "pre_click");
-      await el.click({ delay: 50 });
-      await S(200);
-      await saveShot(page, "post_click");
-
-      // a クリック後、中継ページに遷移して onload で window.open → submit が走る想定
-      // （/search/jkknet/wait.jsp → akiyaJyoukenStartInit に POST）
-      let popupTarget = await popupTargetPromise;
-      if (!popupTarget) {
-        // クリック先が即「中継ページ」だった場合に備えて再監視
-        popupTarget = await page.browser().waitForTarget(
-          (t) => {
-            const u = (t.url() || "").toLowerCase();
-            return u.includes("wait.jsp") || u.includes("jkknet");
-          },
-          { timeout: 10000 }
-        ).catch(() => null);
-      }
-      if (!popupTarget) throw new Error("JKKnet ポップアップを検出できませんでした。");
-
-      const jkkPage = await popupTarget.page();
-      // ネットワークが動く時間を与える
-      await jkkPage.waitForNetworkIdle({ timeout: 15000 }).catch(() => {});
-      return jkkPage;
     }
+    if (!popupTarget) throw new Error("JKKnet ポップアップを検出できませんでした。");
+
+    const jkkPage = await popupTarget.page();
+    await ensureViewport(jkkPage);
+    await jkkPage.waitForNetworkIdle({ timeout: 15000 }).catch(() => {});
+    return jkkPage;
   }
   throw new Error("JKKねっとへのリンクが見つかりませんでした。");
 }
 
 async function clickSearchAndAwaitResults(jkkPage) {
-  // 条件入力を飛ばして「検索」相当を探す（テキスト or value に「検索」が入るもの）
-  async function clickSearchLike() {
-    const clicked = await jkkPage.evaluate(() => {
-      function clickEl(el) {
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return false;
-        el.click();
-        return true;
-      }
-      const isSearchText = (t) => /検索/.test(t || "");
-      // input[type=submit]
-      const inputs = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"]'));
-      for (const el of inputs) {
-        if (isSearchText(el.value) || isSearchText(el.getAttribute("value"))) {
-          if (clickEl(el)) return true;
-        }
-      }
-      // button
-      const btns = Array.from(document.querySelectorAll("button"));
-      for (const el of btns) {
-        if (isSearchText(el.innerText)) {
-          if (clickEl(el)) return true;
-        }
-      }
-      // aタグ
-      const anchors = Array.from(document.querySelectorAll("a"));
-      for (const el of anchors) {
-        if (isSearchText(el.innerText)) {
-          if (clickEl(el)) return true;
-        }
-      }
-      return false;
-    });
-    if (!clicked) throw new Error("検索ボタン相当が見つかりませんでした。");
-  }
-
-  // まずページタイトル or URL が動くまで少し待つ（中継・初期化に時間がかかる想定）
+  await ensureViewport(jkkPage);
   await S(500);
   await saveShot(jkkPage, "search_landing");
   await saveHTML(jkkPage, "search_landing");
 
-  // 検索クリック
-  await clickSearchLike();
-  await S(400);
+  // 「検索」テキスト/ボタンを総当たりでクリック
+  const clicked = await jkkPage.evaluate(() => {
+    function clickable(el) {
+      const r = el.getBoundingClientRect?.();
+      return r && r.width > 0 && r.height > 0;
+    }
+    function clickEl(el) { el.click(); return true; }
 
-  // 結果らしさの検出
+    const isSearch = (t) => /検索/.test((t || "").trim());
+
+    const btns = [
+      ...document.querySelectorAll('input[type="submit"], input[type="button"], button')
+    ];
+    for (const el of btns) {
+      const txt = el.value || el.innerText || el.getAttribute("value") || "";
+      if (isSearch(txt) && clickable(el)) return clickEl(el);
+    }
+    const as = [...document.querySelectorAll("a")];
+    for (const el of as) {
+      const txt = el.innerText || "";
+      if (isSearch(txt) && clickable(el)) return clickEl(el);
+    }
+    return false;
+  });
+  if (!clicked) throw new Error("検索ボタン相当が見つかりませんでした。");
+
+  await S(500);
   const how = await waitResultLike(jkkPage, 30000);
   await saveShot(jkkPage, "result_page");
   await saveHTML(jkkPage, "result_page");
@@ -175,48 +201,61 @@ async function clickSearchAndAwaitResults(jkkPage) {
 
 async function waitResultLike(page, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
-  const urlChanged = (u) =>
-    /result|list|kensaku|searchresult|_result|index\.php|akiya/i.test(u);
+  const urlLike = (u) => /result|list|kensaku|searchresult|_result|index\.php|akiya/i.test(u);
 
   while (Date.now() < deadline) {
+    await ensureViewport(page);
     const url = page.url();
-    if (urlChanged(url)) return `url(${url})`;
+    if (urlLike(url)) return `url(${url})`;
 
-    // 件数や見出しテキスト
     const textHit = await page.evaluate(() => {
-      const body = document.body?.innerText || "";
-      return /件見つかりました|検索結果|物件一覧|該当物件|空き家情報/i.test(body);
+      const t = document.body?.innerText || "";
+      return /件見つかりました|検索結果|物件一覧|該当物件|空き家情報/i.test(t);
     });
     if (textHit) return "text-hit";
 
-    // リストっぽいDOM
     const selHit = await page.$(
       [
         ".result-list",
         ".search-result",
-        ".list",            // 緩め
-        "table.result",     // テーブル型
+        ".list",
+        "table.result",
         '[class*="result"]',
         '[id*="result"]',
       ].join(",")
     );
     if (selHit) return "selector";
-
     await S(500);
   }
   throw new Error("結果待機がタイムアウトしました。");
 }
 
+// ------------------------ main ------------------------
 async function main() {
   await ensureOut();
   const browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    defaultViewport: { width: 1366, height: 960 },
+    headless: true,                          // 'new' での相性問題を避ける
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--window-size=1366,960",
+      "--disable-dev-shm-usage",
+    ],
+    defaultViewport: { width: 1366, height: 960, deviceScaleFactor: 1 },
   });
-  const page = await browser.newPage();
 
-  // 入口（www 優先）
+  // すべての新規ページに viewport を強制
+  browser.on("targetcreated", async (t) => {
+    try {
+      const p = await t.page();
+      if (p) await ensureViewport(p);
+    } catch {}
+  });
+
+  const page = await browser.newPage();
+  await ensureViewport(page);
+
+  // 入口
   const ok = await gotoTop(page);
   if (!ok) {
     await saveShot(page, "entry_referer_skipped");
@@ -225,9 +264,8 @@ async function main() {
   }
 
   try {
-    // 「JKKねっと」→ ポップアップ「JKKnet」を捕まえる
+    // 「JKKねっと」→ ポップアップ捕捉
     const jkkPage = await findAndClickJkknet(page);
-
     // 検索 → 結果判定
     await clickSearchAndAwaitResults(jkkPage);
   } catch (e) {
