@@ -1,22 +1,55 @@
-# .github/workflows/monitor.yml
-name: JKK Monitor
+name: jkk-kosha-search
 
 on:
   workflow_dispatch:
+    inputs:
+      keyword:
+        description: 'フリーワード（未指定なら「コーシャハイム」）'
+        required: false
+        default: 'コーシャハイム'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-kosha-search
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - run: npm install
-      - run: node monitor.mjs
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          # lockfile が無い場合にも対応
+          npm ci || npm install
+          # Playwright本体とUbuntu依存をインストール
+          npx playwright install --with-deps chromium
+
+      - name: Run kosha search
         env:
-          JKK_TOP_URL: ${{ secrets.JKK_TOP_URL }} # 任意。未設定なら www を使う
-      - uses: actions/upload-artifact@v4
+          CI: "true"
+          # workflow_dispatch の入力が無い場合は既定値に
+          JKK_KEYWORD: ${{ github.event.inputs.keyword || 'コーシャハイム' }}
+        run: node jkk_search_kosha.mjs
+
+      - name: Upload artifacts (out/)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: jkk-out
-          path: out/
+          name: jkk-out-${{ github.run_id }}
+          path: |
+            out/**
+          if-no-files-found: warn
+          retention-days: 14
