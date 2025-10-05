@@ -1,304 +1,263 @@
-// monitor.mjs (v4)
-import fs from "fs";
-import path from "path";
-import puppeteer from "puppeteer";
+// JKK: 「コーシャハイム」で検索して結果を拾う最小スクリプト
+// 使い方: npm i && npx playwright install chromium && npm start
+import { chromium } from "playwright";
+import fs from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
 
-const OUT = path.resolve("out");
-const S = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...a) => {
-  const line = a.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
-  fs.appendFileSync(path.join(OUT, "debug.log"), `[${new Date().toISOString()}] ${line}\n`);
-};
+const BASE = "https://jhomes.to-kousya.or.jp/"; // 入口（No.1/No.2で実績あり）
+const KEYWORD = process.env.JKK_KEYWORD || "コーシャハイム";
+const OUTDIR = "out";
 
-const TOPS = [
-  process.env.JKK_TOP_URL?.trim(),
-  "https://www.jkk-tokyo.or.jp/",
-  "http://www.jkk-tokyo.or.jp/",
-  "https://jkk-tokyo.or.jp/",
-  "http://jkk-tokyo.or.jp/",
-].filter(Boolean);
-
-const STARTS = [
-  "https://www.jkk-tokyo.or.jp/search/jkknet/startinit.html",
-  "http://www.jkk-tokyo.or.jp/search/jkknet/startinit.html",
-  "https://jkk-tokyo.or.jp/search/jkknet/startinit.html",
-  "http://jkk-tokyo.or.jp/search/jkknet/startinit.html",
-];
-
-// 保存HTMLに出てくる forwardForm の action 先
-const SERVICE_ACTION = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-
-// ------------------------ utils ------------------------
 async function ensureOut() {
-  if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
+  await fs.mkdir(OUTDIR, { recursive: true });
 }
 
-async function ensureViewport(page) {
-  try {
-    const vp = page.viewport();
-    const need = !vp || !vp.width || !vp.height || vp.width < 320 || vp.height < 320;
-    if (need) await page.setViewport({ width: 1366, height: 960, deviceScaleFactor: 1 });
-    await page.evaluate(() => { try { window.resizeTo(1366, 960); } catch {} });
-  } catch {}
+function stamp() {
+  const z = (n)=>String(n).padStart(2,"0");
+  const d = new Date();
+  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
 }
 
 async function saveShot(page, name) {
-  try {
-    await ensureViewport(page);
-    await page.bringToFront().catch(() => {});
-    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true, captureBeyondViewport: false });
-  } catch (e) {
-    fs.writeFileSync(path.join(OUT, `${name}_shot_error.txt`), String(e?.stack || e));
-  }
+  await page.screenshot({ path: path.join(OUTDIR, `${name}.png`), fullPage: true });
 }
-
 async function saveHTML(page, name) {
-  try {
-    await ensureViewport(page);
-    const html = await page.content();
-    fs.writeFileSync(path.join(OUT, `${name}.html`), html);
-  } catch (e) {
-    fs.writeFileSync(path.join(OUT, `${name}_html_error.txt`), String(e?.stack || e));
-  }
+  const html = await page.content();
+  await fs.writeFile(path.join(OUTDIR, `${name}.html`), html, "utf-8");
 }
 
-function writeCard(filename, title, blocks) {
-  const html = `<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,'Noto Sans JP',sans-serif;background:#f6f7f9;margin:0;padding:60px}
-  .card{max-width:780px;margin:60px auto;background:#fff;border-radius:14px;padding:28px 32px;box-shadow:0 8px 28px rgba(0,0,0,.08)}
-  pre{white-space:pre-wrap;background:#fafafa;padding:10px 12px;border-radius:8px}
-  h1{font-size:20px;margin:0 0 12px;}
-  </style><div class=card><h1>${title}</h1>
-  ${blocks.map(b=>`<pre>${b}</pre>`).join("")}
-  <small>${new Date().toISOString()}</small></div>`;
-  fs.writeFileSync(path.join(OUT, filename), html);
+async function gotoEntry(page) {
+  // 入口は何度か転送することがあるので、堅めに待つ
+  const res = await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 45000 });
+  if (!res) throw new Error("初期アクセスに失敗しました");
+  await page.waitForLoadState("domcontentloaded");
 }
 
-// ------------------------ navigation helpers ------------------------
-async function openAndCapture(page, url, namePrefix) {
-  try {
-    await ensureViewport(page);
-    const res = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
-    if (res && res.ok()) {
-      await saveShot(page, namePrefix);
-      await saveHTML(page, namePrefix);
-      log("OPEN OK:", url);
-      return true;
+async function findFreewordAndSearch(page, keyword) {
+  // 1) まずページ内にフリーワード欄があればそれを使う
+  const selectors = [
+    'input[name*="free"]',
+    'input[id*="free"]',
+    'input[placeholder*="ワード"]',
+    'input[placeholder*="フリー"]',
+    'input[type="text"]'
+  ];
+  let found = null;
+  for (const sel of selectors) {
+    const cand = page.locator(sel).first();
+    if (await cand.count()) {
+      // 可視かつ有効なものを選びたい
+      const vis = await cand.isVisible().catch(()=>false);
+      if (vis) { found = cand; break; }
     }
-  } catch (e) {
-    log("OPEN NG:", url, e?.message || e);
   }
-  return false;
-}
 
-async function gotoByCandidates(page, urls, namePrefix) {
-  const tried = [];
-  for (const u of urls) {
-    tried.push(u);
-    if (await openAndCapture(page, u, namePrefix)) return { ok: true, tried, url: u };
-  }
-  return { ok: false, tried };
-}
-
-async function waitPopup(page, timeout = 15000) {
-  const t = await page.browser().waitForTarget(
-    t => {
-      const u = (t.url() || "").toLowerCase();
-      return u.includes("wait.jsp") || u.includes("jkknet") || u.includes("to-kousya.or.jp");
-    },
-    { timeout }
-  ).catch(() => null);
-  if (!t) return null;
-  const p = await t.page().catch(() => null);
-  if (p) await ensureViewport(p);
-  return p;
-}
-
-// ------------------------ page kind checks ------------------------
-async function isMapPage(p) {
-  const u = (p.url() || "").toLowerCase();
-  if (/akiyachizu/.test(u)) return true;
-  return await p.evaluate(() => !!document.querySelector('map[name="Map"]'));
-}
-async function isJyoukenPage(p) {
-  const u = (p.url() || "").toLowerCase();
-  if (/akiyajyouken/.test(u)) return true;
-  return await p.evaluate(() => !!document.querySelector('form[name="akiSearch"]'));
-}
-async function isResultPageStrict(p) {
-  return await p.evaluate(() => {
-    const t = document.body?.innerText || "";
-    const hasCount   = /件が該当しました/.test(t);                                // 例: "78件が該当しました。"
-    const hasHeading = /先着順あき家の検索結果/.test(t);
-    const hasPager   = !!document.querySelector('[onclick*="movePagingInputGridPage"]');
-    const hasDetail  = !!document.querySelector('a[onclick*="senPage"], img[alt="詳細"]');
-    return hasCount || hasHeading || hasPager || hasDetail;
-  });
-}
-
-// ------------------------ flows ------------------------
-async function launchFromStart(page) {
-  await S(500);
-  await saveShot(page, "start_page");
-  await saveHTML(page, "start_page");
-
-  // すでに子が開いた？
-  let child = await waitPopup(page, 3000);
-  if (child) return child;
-
-  // openMainWindow()/submitNext()/「こちら」リンク
-  const triggered = await page.evaluate(() => {
-    try {
-      if (typeof openMainWindow === "function") { openMainWindow(); return true; }
-      if (typeof submitNext === "function") { submitNext(); return true; }
-      const a = [...document.querySelectorAll("a")].find(x => /こちら/.test(x.innerText));
-      if (a) { a.click(); return true; }
-    } catch {}
-    return false;
-  });
-  if (triggered) {
-    child = await waitPopup(page, 12000);
-    if (child) return child;
-  }
-  return page;
-}
-
-async function openServiceDirect(page) {
-  await ensureViewport(page);
-  await page.setContent(`
-    <!doctype html><meta charset="utf-8">
-    <form id="f" method="post" action="${SERVICE_ACTION}">
-      <input type="hidden" name="redirect" value="true">
-      <input type="hidden" name="url" value="${SERVICE_ACTION}">
-    </form>
-    <script>document.getElementById('f').submit()</script>
-  `);
-  await S(600);
-  const p = await waitPopup(page, 8000);
-  return p || page;
-}
-
-async function ensureJyouken(p) {
-  if (await isMapPage(p)) {
-    log("on map page → back to 条件");
-    await p.evaluate(() => { try { if (typeof areaOpen === "function") areaOpen(); } catch {} });
-    await S(800);
-  }
-  return p;
-}
-
-async function clickSearchStrict(p) {
-  await ensureViewport(p);
-  await S(200);
-
-  // a[onclick*="akiyaJyoukenRef"] / 画像ボタン / input / button
-  const ok = await p.evaluate(() => {
-    function visible(el){ const r = el.getBoundingClientRect?.(); return r && r.width>0 && r.height>0; }
-    function tryClick(sel){
-      const el = document.querySelector(sel);
-      if (el && visible(el)) { el.click(); return true; }
-      return false;
+  // 2) 入口にない場合、検索ページへのリンクを探してクリック
+  if (!found) {
+    const linkTexts = ["空き家", "検索", "さがす", "住まい"];
+    let clicked = false;
+    for (const t of linkTexts) {
+      const link = page.getByRole("link", { name: new RegExp(t) }).first();
+      if (await link.count()) {
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded"),
+          link.click()
+        ]);
+        clicked = true;
+        break;
+      }
     }
-    if (tryClick('a[onclick*="akiyaJyoukenRef"]')) return true;
-    const imgs = Array.from(document.querySelectorAll('img[alt]')).filter(x=>/検索/.test(x.alt||""));
-    if (imgs[0] && visible(imgs[0])) { imgs[0].click(); return true; }
-    const inputs = Array.from(document.querySelectorAll('input[type="image"],input[type="submit"],input[type="button"]'))
-      .filter(x => /検索/.test(x.alt||"") || /検索/.test(x.value||""));
-    if (inputs[0] && visible(inputs[0])) { inputs[0].click(); return true; }
-    const btn = Array.from(document.querySelectorAll("button")).find(b=>/検索/.test(b.innerText||""));
-    if (btn && visible(btn)) { btn.click(); return true; }
-    // 最後の手：関数直叩き
-    try {
-      if (typeof submitPage === "function") { submitPage('akiyaJyoukenRef'); return true; }
-      if (typeof submitAction === "function") { submitAction('akiyaJyoukenRef'); return true; }
-    } catch {}
-    // さらに最後：最初の form を submit
-    const f = document.querySelector("form"); if (f) { f.submit(); return true; }
-    return false;
-  });
-
-  if (!ok) throw new Error("“検索する” ボタンに到達できませんでした。");
-}
-
-async function waitResultLike(p, timeoutMs = 25000) {
-  const deadline = Date.now() + timeoutMs;
-  const urlLike = (u) => /akiyaJyoukenRef|result|list|searchresult|_result|index\.php/i.test(u);
-  while (Date.now() < deadline) {
-    await ensureViewport(p);
-    if (await isResultPageStrict(p)) return "strict";
-    const u = p.url();
-    if (urlLike(u)) return `url(${u})`;
-    const textHit = await p.evaluate(() =>
-      /検索結果|該当件数|物件一覧|該当物件|空家情報/.test(document.body?.innerText || "")
-    );
-    if (textHit) return "text-hit";
-    const selHit = await p.$('[class*="result"],[id*="result"],.search-result,.result-list,table.result');
-    if (selHit) return "selector";
-    await S(400);
+    if (!clicked) {
+      // 最後の手段：hrefに search / result を含むリンク
+      const alt = page.locator('a[href*="search"], a[href*="result"], a[href*="Ref"]');
+      if (await alt.count()) {
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded"),
+          alt.first().click()
+        ]);
+      }
+    }
+    // 遷移先で再探索
+    for (const sel of selectors) {
+      const cand = page.locator(sel).first();
+      if (await cand.count()) {
+        const vis = await cand.isVisible().catch(()=>false);
+        if (vis) { found = cand; break; }
+      }
+    }
   }
-  throw new Error("結果待機がタイムアウトしました。");
+
+  if (!found) throw new Error("フリーワード入力欄が見つかりませんでした。");
+
+  // 入力して「検索」実行
+  await found.fill("");
+  await found.type(keyword, { delay: 10 });
+
+  // 「検索」系ボタンを探す
+  const searchButtons = [
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("検索")',
+    'a:has-text("検索")',
+    'button:has-text("さがす")',
+    'input[value*="検索"]'
+  ];
+  let clicked = false;
+  for (const sel of searchButtons) {
+    const btn = page.locator(sel).first();
+    if (await btn.count()) {
+      const vis = await btn.isVisible().catch(()=>false);
+      if (vis) {
+        await Promise.all([
+          page.waitForLoadState("domcontentloaded"),
+          btn.click()
+        ]);
+        clicked = true;
+        break;
+      }
+    }
+  }
+  if (!clicked) {
+    // Enterキー送信のフォールバック
+    await found.press("Enter");
+    await page.waitForLoadState("domcontentloaded");
+  }
 }
 
-async function runSearch(p) {
-  p = await ensureJyouken(p);
+function onlyDigits(s) {
+  return (s || "").replace(/[^\d.]/g, "");
+}
 
-  await saveShot(p, "search_landing");
-  await saveHTML(p, "search_landing");
+async function extractResults(page) {
+  // 名前と詳細リンクだけ「まずは」取得（高望みしない版）
+  const data = await page.evaluate(() => {
+    const rows = [];
+    const seen = new Set();
 
-  await clickSearchStrict(p);
-  await S(600);
+    // 候補リンク：onclick=senPage(...), hrefにdetail/result等
+    const links = Array.from(document.querySelectorAll(
+      'a[onclick*="senPage"], a[href*="detail"], a[href*="result"], a[href*="Ref"]'
+    ));
 
-  const how = await waitResultLike(p, 30000);
-  await saveShot(p, "result_page");
-  await saveHTML(p, "result_page");
-  log("RESULT DETECT:", how);
+    for (const a of links) {
+      const name = (a.textContent || "").trim();
+      const href = a.getAttribute("href") || "";
+      const onclick = a.getAttribute("onclick") || "";
+      const parent = a.closest("tr, .resultItem, .listItem, .housingList, li, div");
+      const parentText = (parent ? parent.textContent : a.textContent || "").replace(/\s+/g, " ").trim();
 
-  // メタ保存（件数/URL/タイトル）
-  const meta = await p.evaluate(() => {
-    const t = document.body?.innerText || "";
-    const m = t.match(/(\d+)\s*件が該当しました/);
-    return { count: m ? Number(m[1]) : null, url: location.href, title: document.title };
+      const key = name + "||" + href + "||" + onclick;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // 絶対URL化はNode側でやる
+      rows.push({
+        name: name || null,
+        href,
+        onclick,
+        snippet: parentText.slice(0, 300) // ざっくり周辺テキスト
+      });
+    }
+
+    // 名前が何も無いものは除外
+    return rows.filter(r => r.name || r.href || r.onclick);
   });
-  fs.writeFileSync(path.join(OUT, "result_meta.json"), JSON.stringify(meta, null, 2));
+
+  // onclickからIDなどを拾ったり、URLを絶対化
+  const abs = (href) => {
+    try { return new URL(href, "https://jhomes.to-kousya.or.jp/").toString(); }
+    catch { return null; }
+  };
+
+  const normalized = data.map(r => {
+    const idFromOnclick = (r.onclick && /senPage\(([^)]+)\)/.exec(r.onclick))?.[1] || null;
+    return {
+      title: r.name || null,
+      detail_url: r.href ? abs(r.href) : null,
+      onclick: r.onclick || null,
+      listing_id: idFromOnclick,
+      snippet: r.snippet
+    };
+  });
+
+  return normalized;
 }
 
-// ------------------------ main ------------------------
+function toCSV(rows) {
+  if (!rows.length) return "title,detail_url,listing_id\n";
+  const header = Object.keys(rows[0]);
+  const escape = (v) => {
+    const s = String(v ?? "");
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const lines = [header.join(",")];
+  for (const r of rows) {
+    lines.push(header.map(k => escape(r[k])).join(","));
+  }
+  return lines.join("\n") + "\n";
+}
+
 async function main() {
   await ensureOut();
-  const browser = await puppeteer.launch({
+  const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1366,960", "--disable-dev-shm-usage"],
-    defaultViewport: { width: 1366, height: 960, deviceScaleFactor: 1 },
+    args: process.env.CI ? ["--no-sandbox", "--disable-dev-shm-usage"] : []
   });
-  browser.on("targetcreated", async (t) => { const p = await t.page().catch(() => null); if (p) await ensureViewport(p); });
+  const ctx = await browser.newContext({
+    locale: "ja-JP",
+    timezoneId: "Asia/Tokyo",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  });
+  const page = await ctx.newPage();
+  page.setDefaultTimeout(30000);
 
-  const page = await browser.newPage();
-  await ensureViewport(page);
-
-  // 入口 → startinit → 直POST の順でフォールバック
-  const top = await gotoByCandidates(page, TOPS, "entry_referer");
-  if (!top.ok) {
-    const start = await gotoByCandidates(page, STARTS, "startinit_direct");
-    if (!start.ok) {
-      writeCard("entry_referer_skipped.html",
-        "entry skipped",
-        ["Top/Startinit とも到達不可。サービス直POSTで継続。",
-         `tried: ${[...top.tried, ...start.tried].join(", ")}`]);
-      const jkk = await openServiceDirect(page);
-      try { await runSearch(jkk); } catch (e) { fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e)); }
-      await browser.close();
-      return;
-    }
-  }
+  const tag = `kosha_${stamp()}`;
 
   try {
-    const jkk = await launchFromStart(page);
-    await runSearch(jkk);
-  } catch (e) {
-    fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e));
+    console.log(`[JKK] 入口へ… ${BASE}`);
+    await gotoEntry(page);
+    await saveShot(page, `${tag}_01_entry`);
+    await saveHTML(page, `${tag}_01_entry`);
+
+    console.log(`[JKK] フリーワード検索 → 「${KEYWORD}」`);
+    await findFreewordAndSearch(page, KEYWORD);
+
+    // 結果ページの証跡
+    await page.waitForLoadState("domcontentloaded");
+    await saveShot(page, `${tag}_02_result`);
+    await saveHTML(page, `${tag}_02_result`);
+
+    // ざっくり件数テキストも拾っておく（あれば）
+    const countText = await page.evaluate(() => {
+      const el = Array.from(document.querySelectorAll("body *"))
+        .find(e => /件.*該当|検索結果|物件一覧/.test(e.textContent || ""));
+      return el ? el.textContent.trim().replace(/\s+/g, " ").slice(0, 80) : null;
+    });
+    if (countText) console.log(`[JKK] 件数らしき表示: ${countText}`);
+
+    // 結果抽出（タイトル + 詳細URL）
+    const items = await extractResults(page);
+    console.log(`[JKK] 抽出: ${items.length} 件`);
+
+    // 保存
+    const jsonPath = path.join(OUTDIR, `${tag}_items.json`);
+    const csvPath  = path.join(OUTDIR, `${tag}_items.csv`);
+    await fs.writeFile(jsonPath, JSON.stringify({ keyword: KEYWORD, countText, items }, null, 2), "utf-8");
+    await fs.writeFile(csvPath, toCSV(items), "utf-8");
+    console.log(`[JKK] 保存: ${jsonPath}`);
+    console.log(`[JKK] 保存: ${csvPath}`);
+  } catch (err) {
+    console.error("[JKK] 失敗:", err?.message || err);
+    await saveShot(page, `${tag}_err`);
+    await saveHTML(page, `${tag}_err`);
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main();
