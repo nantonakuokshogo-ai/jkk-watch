@@ -1,43 +1,65 @@
-// monitor.mjs (v6) — navの戻りをPage化／タイムアウト復帰＆結果撮影を強化
+// monitor.mjs (v7)
+// JKK 賃貸トップ → JKKねっと → 条件 → 検索 → 一覧を撮影
+// - 3rdパーティ計測スクリプトを遮断（許可ドメインのみ通す）
+// - タイムアウト検出→自動復帰
+// - 常に Page を返す nav ユーティリティ
+// - フレームHTMLもダンプ、結果は result_list.* になければ result_fallback.* を必ず保存
+
 import fs from "fs";
 import path from "path";
 import puppeteer from "puppeteer";
 
 const OUT = path.resolve("out");
 const S = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...a) => {
-  const line = a.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
-  fs.appendFileSync(path.join(OUT, "debug.log"), `[${new Date().toISOString()}] ${line}\n`);
+const NOW = () => new Date().toISOString().replace(/[:.]/g, "-");
+
+// ---- 設定集中 ----
+const CONFIG = {
+  headless: (process.env.JKK_HEADLESS || "true") === "true",
+  viewport: { width: 1366, height: 960, deviceScaleFactor: 1 },
+  timeout: {
+    nav: +(process.env.JKK_NAV_TIMEOUT_MS || 30000),
+    popup: +(process.env.JKK_POPUP_TIMEOUT_MS || 15000),
+  },
+  urls: {
+    tops: [
+      process.env.JKK_TOP_URL?.trim(),
+      "https://www.to-kousya.or.jp/chintai/index.html",
+      "https://www.jkk-tokyo.or.jp/",
+    ].filter(Boolean),
+    starts: [
+      process.env.JKK_START_URL?.trim(),
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaStartInit",
+      "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyachizuStartInit",
+    ].filter(Boolean),
+    servicePost: "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
+    referer: "https://www.to-kousya.or.jp/chintai/index.html",
+  },
+  allowHosts: [
+    /(^|\.)to-kousya\.or\.jp$/i,
+    /(^|\.)jkk-tokyo\.or\.jp$/i,
+    /(^|\.)jhomes\.to-kousya\.or\.jp$/i,
+  ],
 };
 
-const TOPS = [
-  process.env.JKK_TOP_URL?.trim(),
-  "https://www.to-kousya.or.jp/chintai/index.html",
-  "https://www.jkk-tokyo.or.jp/",
-].filter(Boolean);
-
-const STARTS = [
-  process.env.JKK_START_URL?.trim(),
-  "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaStartInit",
-  "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyachizuStartInit",
-].filter(Boolean);
-
-const SERVICE_ACTION = "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit";
-
-async function ensureOut() { if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true }); }
+// ---------- ユーティリティ ----------
+function log(...a) {
+  const line = a.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+  fs.appendFileSync(path.join(OUT, "debug.log"), `[${new Date().toISOString()}] ${line}\n`);
+}
+function ensureOut() {
+  if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
+}
 async function ensureViewport(page) {
-  try {
-    const vp = page.viewport();
-    const need = !vp || !vp.width || !vp.height || vp.width < 320 || vp.height < 320;
-    if (need) await page.setViewport({ width: 1366, height: 960, deviceScaleFactor: 1 });
-    await page.evaluate(() => { try { window.resizeTo(1366, 960); } catch {} });
-  } catch {}
+  const vp = page.viewport();
+  if (!vp || vp.width < 400) await page.setViewport(CONFIG.viewport);
+  await page.evaluate(() => { try { window.resizeTo(1366, 960); } catch {} });
 }
 async function saveShot(page, name) {
   try {
     await ensureViewport(page);
     await page.bringToFront().catch(() => {});
-    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true, captureBeyondViewport: false });
+    await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
   } catch (e) {
     fs.writeFileSync(path.join(OUT, `${name}_shot_error.txt`), String(e?.stack || e));
   }
@@ -51,25 +73,43 @@ async function saveHTML(page, name) {
     fs.writeFileSync(path.join(OUT, `${name}_html_error.txt`), String(e?.stack || e));
   }
 }
-function writeCard(filename, title, blocks) {
-  const b = []
-    .concat(`<html><head><meta charset="utf-8"><title>${title}</title><style>body{font:14px/1.7 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial;max-width:880px;margin:40px auto;padding:0 16px;} code{background:#f5f5f5;padding:2px 6px;border-radius:4px} pre{background:#f5f5f5;padding:12px;border-radius:6px;overflow:auto}</style></head><body>`)
-    .concat(`<h1>${title}</h1>`)
-    .concat(blocks.map(x => `<p>${x}</p>`))
-    .concat(`</body></html>`)
-    .join("\n");
-  fs.writeFileSync(path.join(OUT, filename), b);
+async function dumpFramesHTML(page) {
+  const frames = page.frames().filter(f => f !== page.mainFrame());
+  for (let i = 0; i < frames.length; i++) {
+    try {
+      const html = await frames[i].content();
+      fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html);
+    } catch {}
+  }
 }
 
+// 許可ドメイン以外の「script」を遮断
+async function hardenNetwork(page) {
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    try {
+      const url = new URL(req.url());
+      const host = url.hostname;
+      const allowed = CONFIG.allowHosts.some(rx => rx.test(host));
+      if (!allowed && req.resourceType() === "script") {
+        return req.abort();
+      }
+      return req.continue();
+    } catch {
+      return req.continue();
+    }
+  });
+}
+
+// CSSセレクタ候補を順にクリック
 async function tryClickAny(page, selectors) {
   return await page.evaluate((sels) => {
-    function visible(el){ const r = el.getBoundingClientRect?.(); return r && r.width>0 && r.height>0; }
+    function visible(el){ const r = el?.getBoundingClientRect?.(); return r && r.width>0 && r.height>0; }
     for (const sel of sels) {
-      // CSSに:containsは無いので素直にquerySelectorだけ試す
       if (sel.startsWith("BUTTON_TEXT=")) {
         const text = sel.replace("BUTTON_TEXT=","");
-        const btn = Array.from(document.querySelectorAll("button,input[type=button],input[type=submit]"))
-          .find(b => (b.innerText||b.value||"").includes(text));
+        const btn = Array.from(document.querySelectorAll("button,input[type=button],input[type=submit],input[type=image]"))
+          .find(b => /検索/.test(text) ? /検索/.test((b.innerText||b.value||b.alt||"")) : (b.innerText||b.value||b.alt||"").includes(text));
         if (btn && visible(btn)) { btn.click(); return sel; }
         continue;
       }
@@ -80,21 +120,34 @@ async function tryClickAny(page, selectors) {
   }, selectors);
 }
 
-async function waitPopup(page, timeout = 15000) {
-  const t = await page.browser().waitForTarget(
-    t => {
-      const u = (t.url() || "").toLowerCase();
-      return u.includes("wait.jsp") || u.includes("jkknet") || u.includes("to-kousya.or.jp/search");
-    },
+// nav or 新規ウィンドウのどちらでも Page を返す
+async function waitNavOrNewPage(p, timeout = CONFIG.timeout.nav) {
+  const browser = p.browser();
+  const navSame = p.waitForNavigation({ waitUntil: "domcontentloaded", timeout }).then(() => p).catch(() => null);
+  const newPg  = browser.waitForTarget(t => t.opener() === p.target(), { timeout })
+    .then(t => t?.page().catch(() => null)).catch(() => null);
+  const res = await Promise.race([navSame, newPg]);
+  return res || p;
+}
+
+async function waitPopup(opener, timeout = CONFIG.timeout.popup) {
+  const t = await opener.browser().waitForTarget(
+    t => t.opener() === opener.target(),
     { timeout }
   ).catch(() => null);
-  if (!t) return null;
-  const p = await t.page().catch(() => null);
+  const p = t ? await t.page().catch(() => null) : null;
   if (p) await ensureViewport(p);
   return p;
 }
 
-/* ---------- 状態判定 ---------- */
+// ---------- 画面タイプ判定 ----------
+async function isTimeoutPage(p) {
+  try {
+    const title = typeof p.title === "function" ? await p.title() : "";
+    if (/おわび|timeout|タイムアウト/i.test(title)) return true;
+  } catch {}
+  return await p.evaluate(() => /タイムアウト|おわび/.test(document.body?.innerText || ""));
+}
 async function isMapPage(p) {
   const u = (p.url() || "").toLowerCase();
   if (/akiyachizu/.test(u)) return true;
@@ -103,16 +156,7 @@ async function isMapPage(p) {
 async function isJyoukenPage(p) {
   const u = (p.url() || "").toLowerCase();
   if (/akiyajyouken/.test(u)) return true;
-  const has = await p.evaluate(() => /空家|条件|検索|エリア/.test(document.body?.innerText || ""));
-  return has;
-}
-async function isTimeoutPage(p) {
-  try {
-    const canTitle = typeof p.title === "function";
-    const title = canTitle ? (await p.title()) : "";
-    if (/おわび|timeout|タイムアウト/i.test(title)) return true;
-  } catch {}
-  return await p.evaluate(() => /タイムアウト|おわび/.test(document.body?.innerText || ""));
+  return await p.evaluate(() => /先着順あき家検索|条件|検索|エリア/.test(document.body?.innerText || ""));
 }
 async function isResultLike(p) {
   const u = (p.url() || "").toLowerCase();
@@ -120,13 +164,13 @@ async function isResultLike(p) {
   return await p.evaluate(() => /検索結果|物件|件/.test(document.body?.innerText || ""));
 }
 
-/* ---------- リカバリ ---------- */
+// ---------- 復帰フロー ----------
 async function recoverFromTimeout(currentPage) {
-  log("TIMEOUT detected. Trying to recover.");
+  log("TIMEOUT detected → recover");
   await saveShot(currentPage, "timeout_detected");
   await saveHTML(currentPage, "timeout_detected");
 
-  // 1) 「トップページへ戻る」をクリック
+  // トップへ戻る系
   const clicked = await tryClickAny(currentPage, [
     'a[href*="to-kousya.or.jp/chintai"]',
     'a[href*="index.html"]',
@@ -134,13 +178,13 @@ async function recoverFromTimeout(currentPage) {
   ]);
   if (clicked) {
     await currentPage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
-    await S(500);
+    await S(400);
     await saveShot(currentPage, "after_backtop");
   }
 
-  // 2) StartInit を Referer 付きで直開き → ポップアップ待ち
-  await currentPage.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
-  try { await currentPage.goto(STARTS[0] || STARTS[1], { waitUntil: "domcontentloaded", timeout: 20000 }); } catch {}
+  // StartInit を referer 付きで叩いてポップアップ待ち
+  await currentPage.setExtraHTTPHeaders({ Referer: CONFIG.urls.referer });
+  try { await currentPage.goto(CONFIG.urls.starts[0] || CONFIG.urls.starts[1], { waitUntil: "domcontentloaded", timeout: 20000 }); } catch {}
   const p = await waitPopup(currentPage, 15000);
   if (p) {
     await saveShot(p, "popup_after_recover");
@@ -150,15 +194,13 @@ async function recoverFromTimeout(currentPage) {
   return null;
 }
 
-/* ---------- 検索起動 → 結果へ ---------- */
-async function clickSearchLoose(p) {
-  await ensureViewport(p);
-  await S(300);
+// ---------- 検索操作 ----------
+async function clickSearch(p) {
+  // 条件画面 or 地図画面から「検索」へ進む
   const clicked = await tryClickAny(p, [
+    'a[onclick*="akiyaJyoukenRef"]',
     'a[href*="akiyaJyoukenRef"]',
     'a[href*="akiyaJyoukenStartInit"]',
-    'a[href*="akiyajyouken"]',
-    'a[href*="akiyachizu"]',
     'img[alt*="検索"]',
     'input[type="image"][alt*="検索"]',
     'input[type="submit"][value*="検索"]',
@@ -166,200 +208,134 @@ async function clickSearchLoose(p) {
     'BUTTON_TEXT=検索',
   ]);
   if (!clicked) {
-    await p.evaluate(() => { const f = document.querySelector("form"); f && f.submit && f.submit(); });
+    // フォーム submit のみでも進める保険
+    await p.evaluate(() => { const f = document.querySelector("form"); f?.submit?.(); });
   }
 }
 
-async function clickSearchStrict(p) {
-  await ensureViewport(p);
-  await S(200);
-  const ok = await p.evaluate(() => {
-    function visible(el){ const r = el.getBoundingClientRect?.(); return r && r.width>0 && r.height>0; }
-    function tryClick(sel){
-      const el = document.querySelector(sel);
-      if (el && visible(el)) { el.click(); return true; }
-      return false;
-    }
-    if (tryClick('a[onclick*="akiyaJyoukenRef"]')) return true;
-    const imgs = Array.from(document.querySelectorAll('img[alt]')).filter(x=>/検索/.test(x.alt||""));
-    if (imgs[0] && visible(imgs[0])) { imgs[0].click(); return true; }
-    const inputs = Array.from(document.querySelectorAll('input[type="image"],input[type="submit"],input[type="button"]'))
-      .filter(x => /検索/.test(x.alt||"") || /検索/.test(x.value||""));
-    if (inputs[0] && visible(inputs[0])) { inputs[0].click(); return true; }
-    const btn = Array.from(document.querySelectorAll("button")).find(b=>/検索/.test(b.innerText||""));
-    if (btn && visible(btn)) { btn.click(); return true; }
-    try {
-      if (typeof submitPage === "function") { submitPage('akiyaJyoukenRef'); return true; }
-      if (typeof submitAction === "function") { submitAction('akiyaJyoukenRef'); return true; }
-    } catch {}
-    const f = document.querySelector("form"); if (f) { f.submit(); return true; }
-    return false;
-  });
-  if (!ok) throw new Error("“検索する” ボタンに到達できませんでした。");
+// 100件表示にできるなら切り替え
+async function setItemsPerPage100(p) {
+  try {
+    await p.evaluate(() => {
+      const selects = Array.from(document.querySelectorAll("select"));
+      const s = selects.find(el =>
+        Array.from(el.options || []).some(o => o.textContent?.trim() === "100" || o.value === "100"));
+      if (s) { s.value = "100"; s.dispatchEvent(new Event("change", { bubbles: true })); }
+    });
+  } catch {}
 }
 
-// ★ 修正ポイント：常に Page を返す
-async function waitNavOrNewTarget(p, timeout = 20000) {
-  const browser = p.browser();
-  const navToSamePage = p.waitForNavigation({ waitUntil: "domcontentloaded", timeout })
-    .then(() => p)
-    .catch(() => null);
-  const newPage = browser.waitForTarget(t => t.opener() === p.target(), { timeout })
-    .then(t => t?.page().catch(() => null))
-    .catch(() => null);
-  const res = await Promise.race([navToSamePage, newPage]);
-  return res || p;
-}
-
+// 結果撮影（最低限の証跡を必ず残す）
 async function captureResult(p) {
+  await setItemsPerPage100(p);
   await S(500);
-  const resultLike = await isResultLike(p);
-  await saveShot(p, resultLike ? "result_list" : "result_fallback");
-  await saveHTML(p, resultLike ? "result_list" : "result_fallback");
-
-  // 可能ならフレームも保存
-  const frames = p.frames().filter(f => f !== p.mainFrame());
-  for (let i = 0; i < frames.length; i++) {
-    try { const html = await frames[i].content(); fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html); } catch {}
-  }
+  const ok = await isResultLike(p);
+  await saveShot(p, ok ? "result_list" : "result_fallback");
+  await saveHTML(p, ok ? "result_list" : "result_fallback");
+  await dumpFramesHTML(p);
 }
 
-async function runSearch(p) {
-  if (!p) throw new Error("popup page not found");
-  await ensureViewport(p);
-  await S(300);
-  await saveShot(p, "popup_open");
+// ---------- 起動導線 ----------
+async function launchFromTop(page) {
+  // 1) 賃貸トップを referer 確保のために踏む
+  const topUrl = CONFIG.urls.tops[0];
+  log("OPEN TOP:", topUrl);
+  await page.goto(topUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeout.nav });
+  await ensureViewport(page);
+  await saveShot(page, `entry_referer_${NOW()}`);
+  await saveHTML(page, "entry_referer");
 
+  // 2) トップから StartInit への導線を試し、ポップアップ待ち
+  const clicked = await tryClickAny(page, [
+    'a[href*="akiyaJyoukenStartInit"]',
+    'a[href*="akiyachizuStartInit"]',
+    'a[href*="JKKnet"]',
+  ]);
+  let popup = null;
+  if (clicked) popup = await waitPopup(page, CONFIG.timeout.popup);
+
+  // 3) 導線が見つからない/開かない場合は直接 StartInit + Referer
+  if (!popup) {
+    await page.setExtraHTTPHeaders({ Referer: CONFIG.urls.referer });
+    try { await page.goto(CONFIG.urls.starts[0] || CONFIG.urls.starts[1], { waitUntil: "domcontentloaded", timeout: CONFIG.timeout.nav }); } catch {}
+    popup = await waitPopup(page, CONFIG.timeout.popup);
+  }
+  if (!popup) throw new Error("JKKnet のポップアップが開きませんでした。");
+  await saveShot(popup, "popup_top");
+  await saveHTML(popup, "popup_top");
+  return popup;
+}
+
+async function runFlow(popup) {
+  let p = popup;
+
+  // タイムアウト画面なら復帰
   if (await isTimeoutPage(p)) {
     const recovered = await recoverFromTimeout(p);
     if (!recovered) throw new Error("タイムアウト復帰に失敗しました。");
     p = recovered;
   }
 
-  const onMap = await isMapPage(p);
-  const onJyouken = onMap ? false : await isJyoukenPage(p);
-
-  if (onMap) {
+  // どの画面かで分岐して検索を開始
+  if (await isMapPage(p)) {
     await saveHTML(p, "popup_map");
-    await clickSearchLoose(p);
-  } else if (onJyouken) {
+    await clickSearch(p);
+  } else if (await isJyoukenPage(p)) {
     await saveHTML(p, "popup_jyouken");
-    await clickSearchStrict(p);
+    await clickSearch(p);
   } else {
     await saveHTML(p, "popup_unknown");
-    await clickSearchLoose(p);
+    await clickSearch(p);
   }
 
-  p = await waitNavOrNewTarget(p, 25000);
+  // 遷移（同一タブ or 新タブ）
+  p = await waitNavOrNewPage(p, CONFIG.timeout.nav);
   await S(400);
 
+  // 再度タイムアウトに落ちたら救出
   if (await isTimeoutPage(p)) {
     const recovered = await recoverFromTimeout(p);
-    if (!recovered) throw new Error("検索後にタイムアウト画面。復帰失敗。");
+    if (!recovered) throw new Error("検索後にタイムアウト→復帰失敗。");
     p = recovered;
   }
+
+  // 最終：結果撮影
   await captureResult(p);
 }
 
-/* ---------- 起動ルート ---------- */
-async function submitServicePOST(page) {
-  await page.goto("about:blank");
-  await ensureViewport(page);
-  await page.setContent(`
-    <form id="f" method="post" action="${SERVICE_ACTION}" target="_blank">
-      <input type="hidden" name="_csrf" value="">
-    </form>
-    <script>document.getElementById("f").submit();</script>
-  `, { waitUntil: "domcontentloaded" });
-  return await waitPopup(page, 15000);
-}
-
-async function openServiceDirect(page) {
-  await page.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
-  const p = await submitServicePOST(page);
-  if (!p) throw new Error("Service 直POSTでの起動に失敗しました。");
-  return p;
-}
-
-async function launchFromStart(page) {
-  await saveShot(page, "landing");
-  await saveHTML(page, "landing");
-
-  const clicked = await tryClickAny(page, [
-    'a[href*="akiyachizuStartInit"]',
-    'a[href*="akiyaStartInit"]',
-    'a[href*="akiya"]',
-    'a[onclick*="akiyachizuStartInit"]',
-    'a[onclick*="akiyaStartInit"]',
-  ]);
-
-  let p = null;
-  if (clicked) p = await waitPopup(page, 15000);
-  if (!p) {
-    await page.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
-    try { await page.goto(STARTS[0] || STARTS[1], { waitUntil: "domcontentloaded", timeout: 20000 }); } catch {}
-    p = await waitPopup(page, 15000);
-  }
-  if (!p) throw new Error("ポップアップ（JKKNET）が開きませんでした。");
-
-  await saveShot(p, "popup_top");
-  await saveHTML(p, "popup_top");
-  return p;
-}
-
-/* ---------- エントリー ---------- */
-async function openAndCaptureWithLog(page, url, namePrefix) {
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await ensureViewport(page);
-    await S(400);
-    const name = `${namePrefix}_${Date.now()}`;
-    await saveShot(page, name);
-    await saveHTML(page, namePrefix);
-    log("OPEN OK:", url);
-    return true;
-  } catch (e) { log("OPEN NG:", url, e?.message || e); }
-  return false;
-}
-async function gotoByCandidates(page, urls, namePrefix) {
-  const tried = [];
-  for (const u of urls) { tried.push(u); if (await openAndCaptureWithLog(page, u, namePrefix)) return { ok: true, tried, url: u }; }
-  return { ok: false, tried };
-}
-
 async function main() {
-  await ensureOut();
+  ensureOut();
+
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: CONFIG.headless,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1366,960", "--disable-dev-shm-usage"],
-    defaultViewport: { width: 1366, height: 960, deviceScaleFactor: 1 },
+    defaultViewport: CONFIG.viewport,
   });
-  browser.on("targetcreated", async (t) => { const p = await t.page().catch(() => null); if (p) await ensureViewport(p); });
-
-  const page = await browser.newPage();
-  await ensureViewport(page);
-
-  const top = await gotoByCandidates(page, TOPS, "entry_referer");
-  if (!top.ok) {
-    const start = await gotoByCandidates(page, STARTS, "startinit_direct");
-    if (!start.ok) {
-      writeCard("entry_referer_skipped.html","entry skipped",[
-        "Top/Startinit とも到達不可。サービス直POSTで継続。",
-        `tried: ${[...top.tried, ...start.tried].join(", ")}`]);
-      const jkk = await openServiceDirect(page);
-      try { await runSearch(jkk); } catch (e) { fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e)); }
-      await browser.close();
-      return;
-    }
-  }
 
   try {
-    const jkk = await launchFromStart(page);
-    await runSearch(jkk);
+    const page = await browser.newPage();
+    await hardenNetwork(page);
+    await ensureViewport(page);
+
+    // Top 候補を順に試す
+    let opened = false;
+    for (const u of CONFIG.urls.tops) {
+      try { await page.goto(u, { waitUntil: "domcontentloaded", timeout: CONFIG.timeout.nav }); opened = true; break; }
+      catch (e) { log("TOP open failed:", u, e?.message || e); }
+    }
+    if (!opened) throw new Error("賃貸トップに到達できませんでした。");
+
+    await saveShot(page, `landing_${NOW()}`);
+    await saveHTML(page, "landing");
+
+    const popup = await launchFromTop(page);
+    await runFlow(popup);
   } catch (e) {
     fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e));
+    log("FATAL", e?.stack || e);
   } finally {
     await browser.close();
   }
 }
-main().catch(e => { console.error(e); process.exit(1); });
+
+main().catch(err => { console.error(err); process.exit(1); });
