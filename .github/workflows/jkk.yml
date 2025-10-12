@@ -39,7 +39,7 @@ jobs:
         with:
           node-version: '20'
 
-      # Noble/Jammy 両対応：存在する方だけ入れる（t64問題の回避）
+      # Ubuntu 24.04 でも 22.04 でも通る可搬的な libs セット
       - name: Install system libs (portable)
         shell: bash
         run: |
