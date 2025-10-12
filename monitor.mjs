@@ -1,180 +1,135 @@
-// monitor.mjs (v13)
-// ねらい：必ず終了する・どこで止まったか trace.zip で辿れる
-// - グローバル watchdog（9分）
-// - クリック→遷移は Promise.all で同時待機
-// - ポップアップ失敗時は Referer 付きで条件ページに直行
-// - 住宅名（カナ）へ「コーシャハイム」→検索→一覧撮影
-// - Playwright Tracing を artifacts/trace.zip に保存
+// monitor.mjs
+import { chromium } from 'playwright';
+import fs from 'fs/promises';
+import path from 'path';
 
-import fs from "node:fs/promises";
-import path from "node:path";
-import { chromium } from "playwright";
+const OUT = 'artifacts';
+const JKK_TOP = 'https://www.to-kousya.or.jp/chintai/';
 
-const OUT = process.env.OUT_DIR || "artifacts";
-const KANA = (process.env.JKK_SEARCH_KANA || "コーシャハイム").trim();
-
-const TOPS = [
-  "https://www.to-kousya.or.jp/chintai/index.html",
-  "https://www.jkk-tokyo.or.jp/",
-];
-const STARTS = [
-  "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaStartInit",
-  "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyachizuStartInit",
-  "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyoukenStartInit",
-];
-
-const KANA_SEL = 'input[name="akiyaInitRM.akiyaRefM.jyutakuKanaName"]';
-
-const TRACE = {
-  startedAt: new Date().toISOString(),
-  kana_input: { requested: KANA, ok: false, value: "", used: KANA_SEL },
-  result: { url: "", title: "", rows: 0, detailsCount: 0, querySeen: false },
-};
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function ensureDir(d) { await fs.mkdir(d, { recursive: true }); }
-async function dump(page, name, full = true) {
-  await ensureDir(OUT);
-  await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: full });
-  await fs.writeFile(path.join(OUT, `${name}.html`), await page.content(), "utf8");
+function ts() {
+  const d = new Date();
+  const z = n => `${n}`.padStart(2, '0');
+  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}T${z(d.getHours())}-${z(d.getMinutes())}-${z(d.getSeconds())}`;
 }
-function now() { return new Date().toISOString().replace(/[:]/g, "-"); }
-
-async function run() {
+async function save(page, name) {
   await ensureDir(OUT);
+  const t = `${name}_${ts()}`;
+  await fs.writeFile(path.join(OUT, `${t}.html`), await page.content(), { encoding: 'utf8' });
+  await page.screenshot({ path: path.join(OUT, `${t}.png`), fullPage: true });
+}
 
-  // --- Watchdog: 9分で強制終了（ジョブ全体は 30 分でも、スクリプトは必ず切る）
-  const watchdog = setTimeout(async () => {
-    await fs.writeFile(path.join(OUT, "final_error.txt"), "Watchdog timeout", "utf8");
-    process.exit(0);
-  }, 9 * 60 * 1000);
+async function withTimeout(promise, ms, label) {
+  let to;
+  const timer = new Promise((_, rej) => (to = setTimeout(() => rej(new Error(`Timeout: ${label} (${ms}ms)`)), ms)));
+  try { return await Promise.race([promise, timer]); }
+  finally { clearTimeout(to); }
+}
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"]
-  });
+function isOwabiHtml(html) {
+  return html.includes('JKKねっと：おわび') || html.includes('/search/jkknet/images/owabi');
+}
+
+async function runOnce() {
+  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 900 },
-    locale: "ja-JP",
-    timezoneId: "Asia/Tokyo",
+    locale: 'ja-JP',
+    timezoneId: 'Asia/Tokyo',
     userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    extraHTTPHeaders: { Referer: TOPS[0] }, // 直行時のガード
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
   });
-  context.setDefaultTimeout(15000);
-
-  // Playwright trace
-  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  // 軽量化（速度＝タイムアウト対策）
+  await context.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'font', 'media'].includes(type)) return route.abort();
+    route.continue();
+  });
 
   const page = await context.newPage();
-  page.on("console", (m) => console.log("[page]", m.type(), m.text()));
-  page.on("pageerror", (e) => console.log("[pageerror]", e.message));
+  page.setDefaultTimeout(20_000);
+  page.setDefaultNavigationTimeout(25_000);
 
-  // 1) トップへ
-  for (const u of TOPS) {
-    try {
-      await page.goto(u, { waitUntil: "domcontentloaded" });
-      break;
-    } catch {}
-  }
-  await dump(page, `landing_${now()}`);
-
-  // 2) JKKねっと（条件ページ）へ：ポップアップ経由 → 失敗時は直行
-  let jyouken = null;
   try {
-    const popupPromise = page.waitForEvent("popup", { timeout: 8000 });
-    // ページ上の「お部屋を検索」など、JKKねっとへの導線を雑にクリック
-    await Promise.any([
-      page.locator('a[href*="akiyaJyoukenStartInit"]').first().click({ timeout: 3000 }),
-      page.locator('a[href*="akiyaJyoukenInit"]').first().click({ timeout: 3000 }),
-      page.locator('a:has-text("JKKねっと")').first().click({ timeout: 3000 }),
-    ]).catch(() => {});
-    const pop = await popupPromise.catch(() => null);
-    if (pop) {
-      jyouken = pop;
-      await jyouken.waitForLoadState("domcontentloaded").catch(() => {});
-      await dump(jyouken, "entry_referer");
-    }
-  } catch {}
+    // 1) トップへ
+    await withTimeout(page.goto(JKK_TOP, { waitUntil: 'domcontentloaded' }), 25_000, 'goto top');
+    await save(page, 'landing');
 
-  // 直行（Referer 付き）フォールバック
-  if (!jyouken) {
-    for (const s of STARTS) {
-      try {
-        await page.goto(s, { waitUntil: "domcontentloaded" });
-        jyouken = page;
-        break;
-      } catch {}
+    // 2) 「JKKねっと」クリック → ポップアップ捕捉（entry_referer → popup_top）
+    const [popup] = await withTimeout(Promise.all([
+      page.waitForEvent('popup'),
+      page.getByRole('link', { name: /JKKねっと/ }).click()
+    ]), 20_000, 'open popup');
+
+    await withTimeout(popup.waitForLoadState('domcontentloaded'), 20_000, 'popup load');
+    await save(popup, 'entry_referer');
+
+    // entry_referer が自動遷移して popup_top に到達するまで待機
+    await withTimeout(popup.waitForURL(/\/search\/jkknet\/.*(top|search).*\.html/i), 20_000, 'redirect to popup_top');
+    await save(popup, 'popup_top');
+
+    // 「先着順あき家検索」へ（同一ウィンドウ遷移）
+    // a要素のテキストが環境差分で揺れるため href 部分で取得
+    const senchaku = popup.locator('a[href*="senchakujun"] , a:has-text("先着順あき家検索")').first();
+    await withTimeout(Promise.all([
+      popup.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+      senchaku.click()
+    ]), 20_000, 'go to search');
+
+    // 3) フレーム(main)の検索フォームに「住宅名（カナ）」入力
+    const main = await withTimeout(
+      popup.waitForSelector('frame[name="main"]'), 20_000, 'wait main frame'
+    );
+    const frame = await popup.frame({ name: 'main' });
+    if (!frame) throw new Error('main frame not found');
+
+    // 大きいテキスト枠（住宅名（カナ））を特定：label 近辺 or 最初の text input 行
+    // 画面が古いHTMLなので name 属性にフォールバック
+    const kanaInput =
+      frame.locator('input[type="text"]').first();
+
+    await withTimeout(kanaInput.waitFor(), 10_000, 'kana input appear');
+    await kanaInput.fill('コーシャハイム');
+    await save(popup, 'jyouken_filled');
+
+    // 4) 「検索する」クリック → 結果一覧へ
+    const searchBtn = frame.getByRole('button', { name: /検索する/ }).first()
+      .or(frame.locator('input[type="image"][alt="検索する"] , input[type="submit"][value*="検索"]'));
+
+    await withTimeout(Promise.all([
+      popup.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+      searchBtn.click()
+    ]), 25_000, 'submit search');
+
+    // 5) 結果確認 & 保存
+    const html = await popup.content();
+    if (isOwabiHtml(html)) {
+      await save(popup, 'owabi');
+      throw new Error('Server returned "おわび" (session/route invalid).');
     }
+
+    // “詳細” や 一覧テーブルを軽く確認
+    await withTimeout(popup.locator('text=詳細').first().waitFor({ state: 'visible' }).catch(() => Promise.resolve()), 5_000, 'result probe');
+    await save(popup, 'result_list');
+
+    await browser.close();
+    return { ok: true };
+  } catch (e) {
+    console.error('[ERROR]', e.message);
+    await save(page, 'last_page_fallback');
+    await browser.close();
+    return { ok: false, error: e };
   }
-  if (!jyouken) throw new Error("条件入力ページに到達できませんでした。");
-
-  await dump(jyouken, "popup_top");
-  await dump(jyouken, "popup_jyouken");
-
-  // 3) 住宅名（カナ）入力
-  const kana = jyouken.locator(KANA_SEL);
-  await kana.waitFor({ state: "visible" });
-  await kana.fill("");
-  await kana.type(KANA, { delay: 15 });
-  await jyouken.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (el) { el.style.outline = "3px solid #ff0033"; el.style.outlineOffset = "2px"; }
-  }, KANA_SEL);
-  TRACE.kana_input.ok = true;
-  TRACE.kana_input.value = KANA;
-  await dump(jyouken, "jyouken_filled");
-
-  // 4) 検索実行：画像ボタン or submitAction → 最後は form.submit
-  const clickSearch = async () => {
-    const imgBtn = jyouken.locator('input[type="image"][src*="bt_kensaku"]');
-    if (await imgBtn.count()) { await imgBtn.first().click(); return true; }
-    const tried = await jyouken.evaluate(() => {
-      if (typeof window.submitAction === "function") { window.submitAction("akiyaJyoukenRef"); return true; }
-      if (typeof window.submitPage === "function") { window.submitPage("akiyaJyoukenResult"); return true; }
-      const f = document.forms[0]; if (f) { f.submit(); return true; }
-      return false;
-    });
-    return tried;
-  };
-
-  await Promise.race([
-    (async () => {
-      await Promise.allSettled([
-        jyouken.waitForNavigation({ waitUntil: "domcontentloaded" }),
-        clickSearch()
-      ]);
-    })(),
-    (async () => { await sleep(8000); })() // 8秒で切り上げ（次に直で結果判定）
-  ]);
-
-  // 5) 結果ページの要約＋保存
-  await jyouken.waitForLoadState("domcontentloaded").catch(() => {});
-  TRACE.result.url = jyouken.url();
-  try { TRACE.result.title = await jyouken.title(); } catch {}
-
-  const rows = await jyouken.locator("table tr").count().catch(() => 0);
-  const details = await jyouken.locator('input[type="image"][src*="bt_shousai"], a:has-text("詳細")').count().catch(() => 0);
-  const bodyText = await jyouken.evaluate(() => document.body?.innerText || "").catch(() => "");
-  TRACE.result.rows = rows;
-  TRACE.result.detailsCount = details;
-  TRACE.result.querySeen = bodyText.includes(KANA);
-
-  await dump(jyouken, "result_list");
-  await fs.writeFile(path.join(OUT, "trace.json"), JSON.stringify(TRACE, null, 2), "utf8");
-
-  // trace.zip
-  await context.tracing.stop({ path: path.join(OUT, "trace.zip") });
-
-  clearTimeout(watchdog);
-  await browser.close();
 }
 
-run().catch(async (e) => {
-  try {
-    await ensureDir(OUT);
-    await fs.writeFile(path.join(OUT, "final_error.txt"), String(e?.stack || e), "utf8");
-  } finally {
-    process.exit(1);
+(async () => {
+  await ensureDir(OUT);
+  // 最大2回まで自動リトライ（「おわび」対策）
+  for (let i = 1; i <= 2; i++) {
+    console.log(`--- attempt ${i} ---`);
+    const res = await runOnce();
+    if (res.ok) return;
+    if (i === 2) process.exit(1);
+    // 短いクールダウン
+    await new Promise(r => setTimeout(r, 1500));
   }
-});
+})();
