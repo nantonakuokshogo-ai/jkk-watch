@@ -1,9 +1,10 @@
-// monitor.mjs (v10)
+// monitor.mjs (v11)
 // 目的: 「住宅名（カナ）」に 'コーシャハイム' を入れて検索 → 一覧を撮影
-// 特徴:
+// 仕様:
 //  - name="akiyaInitRM.akiyaRefM.jyutakuKanaName" を優先して直指定（見つからなければヒューリスティック）
+//  - こだわり条件ブロックを自動で開く
 //  - 入力直後の欄に赤枠 → jyouken_filled.png を保存
-//  - trace.json に入力・結果要約を記録（入った？出た？が数値で判る）
+//  - trace.json に入力・結果要約を記録（入った？出た？が数値でわかる）
 //  - タイムアウト画面の自動復帰、ポップアップ0幅の吸収、フレームHTMLもダンプ
 
 import fs from "fs";
@@ -22,7 +23,6 @@ const CONFIG = {
     nav: +(process.env.JKK_NAV_TIMEOUT_MS || 30000),
     popup: +(process.env.JKK_POPUP_TIMEOUT_MS || 15000),
   },
-  // ここを書き換える/環境変数で上書きすれば別ワードも可
   kanaQuery: (process.env.JKK_KANA_QUERY || "コーシャハイム").trim(),
   urls: {
     tops: [
@@ -45,17 +45,15 @@ const CONFIG = {
   ],
 };
 
-// ===== 簡易トレース（都度書き出し）=====
+// ===== 簡易トレース =====
 const TRACE = {};
 const trace = (k, v) => {
   TRACE[k] = v;
-  fs.writeFileSync(path.join(OUT, "trace.json"), JSON.stringify(TRACE, null, 2));
+  try { fs.writeFileSync(path.join(OUT, "trace.json"), JSON.stringify(TRACE, null, 2)); } catch {}
 };
 
 // ===== ユーティリティ =====
-function ensureOut() {
-  if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
-}
+function ensureOut() { if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true }); }
 async function ensureViewport(page) {
   const vp = page.viewport();
   if (!vp || vp.width < 400) await page.setViewport(CONFIG.viewport);
@@ -76,7 +74,7 @@ async function saveShot(page, name) {
     await page.bringToFront().catch(() => {});
     await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true });
   } catch (e) {
-    fs.writeFileSync(path.join(OUT, `${name}_shot_error.txt`), String(e?.stack || e));
+    try { fs.writeFileSync(path.join(OUT, `${name}_shot_error.txt`), String(e?.stack || e)); } catch {}
   }
 }
 async function saveHTML(page, name) {
@@ -85,16 +83,13 @@ async function saveHTML(page, name) {
     const html = await page.content();
     fs.writeFileSync(path.join(OUT, `${name}.html`), html);
   } catch (e) {
-    fs.writeFileSync(path.join(OUT, `${name}_html_error.txt`), String(e?.stack || e));
+    try { fs.writeFileSync(path.join(OUT, `${name}_html_error.txt`), String(e?.stack || e)); } catch {}
   }
 }
 async function dumpFramesHTML(page) {
   const frames = page.frames().filter(f => f !== page.mainFrame());
   for (let i = 0; i < frames.length; i++) {
-    try {
-      const html = await frames[i].content();
-      fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html);
-    } catch {}
+    try { const html = await frames[i].content(); fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html); } catch {}
   }
 }
 async function hardenNetwork(page) {
@@ -146,10 +141,7 @@ async function waitPopup(opener, timeout = CONFIG.timeout.popup) {
 
 // ===== 画面判定 =====
 async function isTimeoutPage(p) {
-  try {
-    const title = typeof p.title === "function" ? await p.title() : "";
-    if (/おわび|timeout|タイムアウト/i.test(title)) return true;
-  } catch {}
+  try { const title = typeof p.title === "function" ? await p.title() : ""; if (/おわび|timeout|タイムアウト/i.test(title)) return true; } catch {}
   return await p.evaluate(() => /タイムアウト|おわび/.test(document.body?.innerText || ""));
 }
 async function isMapPage(p) {
@@ -165,7 +157,13 @@ async function isJyoukenPage(p) {
 async function isResultLike(p) {
   const u = (p.url() || "").toLowerCase();
   if (/result|list|kensaku|search/.test(u)) return true;
-  return await p.evaluate(() => /検索結果|物件|件/.test(document.body?.innerText || ""));
+  return await p.evaluate(() => {
+    const items = Array.from(document.querySelectorAll("a,img,input"))
+      .filter(el => /詳細/.test((el.alt || el.value || el.innerText || "")));
+    const hasRows = items.length > 0;
+    const titleish = /検索結果|物件一覧|件/.test(document.body?.innerText || "");
+    return hasRows && titleish;
+  });
 }
 
 // ===== 復帰 =====
@@ -207,75 +205,75 @@ async function ensureJyouken(p) {
   return p;
 }
 
-// ===== カナ入力＋検索（直指定→フォールバック） =====
+// ===== カナ入力＋検索 =====
 async function fillKanaAndSearch(p, keyword) {
+  // 「こだわり条件」を開いてから入力（閉じていると欄が不可視のことがある）
+  await p.evaluate(() => {
+    const openers = Array.from(document.querySelectorAll('img, a, span'))
+      .filter(el => /こだわり|さらにこだわり条件|指定して検索/.test(el.alt || el.innerText || ""));
+    if (openers[0]) openers[0].click();
+  });
+  await S(200);
+
+  // 入力（直指定 → フォールバック）
   const info = await p.evaluate((kw) => {
     const result = { ok: false, value: "", used: "" };
+    const vis = (x) => x && x.offsetWidth > 0 && x.offsetHeight > 0 && !x.disabled && !x.readOnly;
 
-    // 1) 公式フィールド名でピンポイント
-    const preferred = document.querySelector('input[name="akiyaInitRM.akiyaRefM.jyutakuKanaName"]');
+    let el = document.querySelector('input[name="akiyaInitRM.akiyaRefM.jyutakuKanaName"]');
 
-    // 可視判定
-    const visible = (x) => x && x.offsetWidth > 0 && x.offsetHeight > 0 && !x.disabled && !x.readOnly;
-
-    let el = preferred && visible(preferred) ? preferred : null;
-
-    // 2) 見つからない/不可視ならヒューリスティック
-    if (!el) {
-      const KANA_RX = /(住宅名|建物名).*(カナ|ｶﾅ)|カナ.*(住宅名|建物名)/i;
-      const cands = Array.from(document.querySelectorAll('input[type="text"],input[type="search"],input:not([type])'))
-        .filter(visible);
+    if (!vis(el)) {
+      const KANA_RX = /(住宅名|建物名).*(カナ|ｶﾅ)|カナ.*(住宅名|建物名)/;
+      const cands = Array.from(document.querySelectorAll('input[type="text"],input[type="search"],input:not([type])')).filter(vis);
       const score = (x) => {
+        const t = [x.id, x.name, x.placeholder, x.title].join(" ");
         let s = 0;
-        const txt = [x.id, x.name, x.placeholder, x.title].join(" ");
-        if (/kana|ｶﾅ|カナ/i.test(txt)) s += 3;
-        if (/jyutaku|jutaku|住宅|建物/i.test(txt)) s += 2;
+        if (/jyutakuKanaName|kana|カナ|ｶﾅ/i.test(t)) s += 4;
+        if (/jyutaku|住宅|建物/i.test(t)) s += 2;
         const lab = x.id ? document.querySelector(`label[for="${x.id}"]`) : null;
-        if (KANA_RX.test((lab?.innerText || "").trim())) s += 4;
+        if (KANA_RX.test((lab?.innerText || ""))) s += 3;
         const cell = x.closest("td,th,div,li") || x.parentElement;
-        if (KANA_RX.test((cell?.previousElementSibling?.innerText || cell?.innerText || ""))) s += 2;
-        if ((x.type || "").toLowerCase() === "text" || (x.type || "").toLowerCase() === "search") s += 1;
+        if (KANA_RX.test((cell?.innerText || ""))) s += 2;
         return s;
       };
       el = cands.sort((a, b) => score(b) - score(a))[0] || null;
     }
+    if (!vis(el)) return result;
 
-    if (!visible(el)) return result;
+    // 念のためひらがな→カタカナ変換
+    const toKatakana = (s) => s.replace(/[\u3041-\u3096]/g, ch => String.fromCharCode(ch.charCodeAt(0) + 0x60));
+    const v = toKatakana(kw);
 
-    try {
-      el.focus();
-      el.value = "";
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.value = kw; // 全角カナ
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.focus();
+    el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.value = v;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
 
-      // スクショで見える赤枠
-      el.style.outline = "3px solid #ff0033";
-      el.style.outlineOffset = "2px";
+    // 証跡（赤枠）
+    el.style.outline = "3px solid #ff0033";
+    el.style.outlineOffset = "2px";
 
-      result.ok = true;
-      result.value = el.value;
-      result.used = el.name || el.id || "";
-      return result;
-    } catch {
-      return result;
-    }
+    result.ok = true;
+    result.value = el.value;
+    result.used  = el.name || el.id || "";
+    return result;
   }, keyword);
 
   trace("kana_input", { requested: keyword, ...info });
   await saveShot(p, "jyouken_filled");
   await saveHTML(p, "jyouken_filled");
 
-  // 検索実行（ボタン/リンク/画像クリック＋保険で form.submit）
-  await tryClickAny(p, [
-    'a[onclick*="akiyaJyoukenRef"]','a[href*="akiyaJyoukenRef"]',
-    'img[alt*="検索"]','input[type="image"][alt*="検索"]',
-    'input[type="submit"][value*="検索"]','input[type="button"][value*="検索"]',
-    'BUTTON_TEXT=検索する','BUTTON_TEXT=検索',
-  ]);
-  await p.evaluate(() => { const f = document.forms["akiSearch"] || document.querySelector("form"); f?.submit?.(); });
-
+  // 公式 submitAction を優先使用（未定義ならフォールバック）
+  await p.evaluate(() => {
+    if (typeof submitAction === "function") {
+      submitAction('akiyaJyoukenRef');
+    } else {
+      const f = document.forms["akiSearch"] || document.querySelector("form");
+      f?.submit?.();
+    }
+  });
   return info;
 }
 
@@ -291,7 +289,7 @@ async function setItemsPerPage100(p) {
 }
 async function captureResult(p) {
   await setItemsPerPage100(p);
-  await S(400);
+  await S(500);
   const summary = await p.evaluate((kw) => {
     const detailsCount = Array.from(document.querySelectorAll("a,img,input"))
       .filter(el => /詳細/.test((el.alt || el.value || el.innerText || ""))).length;
@@ -350,7 +348,7 @@ async function runFlow(popup) {
   await fillKanaAndSearch(p, CONFIG.kanaQuery);
 
   p = await waitNavOrNewPage(p, CONFIG.timeout.nav);
-  await S(300);
+  await S(400);
 
   if (await isTimeoutPage(p)) {
     const r = await recoverFromTimeout(p);
@@ -374,11 +372,10 @@ async function main() {
     await hardenNetwork(page);
     await ensureViewport(page);
 
-    // トップ候補を順に試す
     let opened = false;
     for (const u of CONFIG.urls.tops) {
       try { await page.goto(u, { waitUntil: "domcontentloaded", timeout: CONFIG.timeout.nav }); opened = true; trace("top_open", u); break; }
-      catch (e) { fs.appendFileSync(path.join(OUT, "debug.log"), `TOP open failed ${u}: ${e?.message || e}\n`); }
+      catch (e) { try { fs.appendFileSync(path.join(OUT, "debug.log"), `TOP open failed ${u}: ${e?.message || e}\n`); } catch {} }
     }
     if (!opened) throw new Error("賃貸トップに到達できませんでした。");
 
@@ -388,7 +385,7 @@ async function main() {
     const popup = await launchFromTop(page);
     await runFlow(popup);
   } catch (e) {
-    fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e));
+    try { fs.writeFileSync(path.join(OUT, "final_error.txt"), String(e?.stack || e)); } catch {}
   } finally {
     await browser.close();
   }
