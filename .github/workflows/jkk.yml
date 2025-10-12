@@ -1,42 +1,41 @@
-name: jkk-watch
+name: run
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 */3 * * *"
+    - cron: "0 * * * *" # 毎時
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
-      - name: Install deps
-        run: npm install
+      - name: Install npm deps
+        run: npm ci
 
       - name: Install Playwright (browsers + system deps)
-        run: npx --yes playwright@latest install --with-deps chromium
+        run: npx playwright install --with-deps
 
       - name: Run script
         env:
-          JKK_SEARCH_KANA: "コーシャハイム"
-          OUT_DIR: "artifacts"
-          # 詳細ログを見たい時は ↓ を有効化
+          # 必要なら Playwright ログを出す
           # DEBUG: "pw:api"
         run: |
           mkdir -p artifacts
-          node monitor.mjs || true
+          node monitor.mjs
 
-      - name: Upload artifacts (screenshots, HTML, trace.zip)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-artifacts-${{ github.run_id }}
+          name: jkk-watch-${{ github.run_number }}
           path: artifacts/**
-          retention-days: 14
+          if-no-files-found: warn
