@@ -43,22 +43,35 @@ jobs:
           # cache: 'npm'
 
       - name: Show base image
+        shell: bash
         run: |
           uname -a
           . /etc/os-release
           echo "Image: $PRETTY_NAME"
 
-      - name: Install system libs (Jammy/Noble compatible)
+      - name: Install system libs (Jammy/Noble portable v3)
+        shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # 候補リスト（存在するものだけ入れる）
-          PKGS="
+
+          # 最初に存在したものを選ぶヘルパ
+          choose() {
+            for n in "$@"; do
+              if apt-cache show "$n" >/dev/null 2>&1; then
+                echo "$n"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          PKGS=(
             ca-certificates
             fonts-liberation
             libatk-bridge2.0-0
             libatk1.0-0
-            libcups2 libcups2t64
+            "$(choose libcups2t64 libcups2 || true)"
             libdbus-1-3
             libdrm2
             libgbm1
@@ -80,18 +93,17 @@ jobs:
             libxshmfence1
             libpango-1.0-0
             libpangocairo-1.0-0
-            libasound2 libasound2t64
-          "
-          TO_INSTALL=()
-          for p in $PKGS; do
-            if apt-cache show "$p" >/dev/null 2>&1; then
-              TO_INSTALL+=("$p")
-            fi
+            "$(choose libasound2t64 libasound2 || true)"
+          )
+
+          # 空要素を除去
+          INSTALL=()
+          for p in "${PKGS[@]}"; do
+            if [ -n "$p" ]; then INSTALL+=("$p"); fi
           done
-          if [ ${#TO_INSTALL[@]} -gt 0 ]; then
-            # 重複を除去（libcups2 / libcups2t64 のような両立候補が両方ある場合に対策）
-            mapfile -t UNIQUE < <(printf "%s\n" "${TO_INSTALL[@]}" | awk '!x[$0]++')
-            sudo apt-get install -y --no-install-recommends "${UNIQUE[@]}"
+
+          if [ ${#INSTALL[@]} -gt 0 ]; then
+            sudo apt-get install -y --no-install-recommends "${INSTALL[@]}"
           fi
 
       - name: Install dependencies
