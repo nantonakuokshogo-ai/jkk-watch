@@ -3,11 +3,12 @@ name: jkk-watch
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 */3 * * *" # 3時間ごと（任意で変更可）
+    - cron: "12 */3 * * *"  # 任意で変更OK
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -18,23 +19,26 @@ jobs:
         with:
           node-version: "20"
 
-      # 依存とブラウザ & 必要ライブラリをまとめて導入（libasound2 の t64 問題も吸収）
-      - name: Install Playwright Browsers & Deps
-        uses: microsoft/playwright-github-action@v1
-
-      - name: Install deps
+      - name: Install npm deps
         run: npm install
+
+      # 公式CLIでブラウザ本体＋必要OSパッケージをまとめて導入
+      - name: Install Playwright (browsers + system deps)
+        run: npx --yes playwright@latest install --with-deps chromium
 
       - name: Run script
         env:
           JKK_SEARCH_KANA: "コーシャハイム"
           OUT_DIR: "artifacts"
-        run: node monitor.mjs
+        run: |
+          mkdir -p artifacts
+          node monitor.mjs || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jkk-artifacts-${{ github.run_id }}
-          path: artifacts/
+          path: artifacts/**
           if-no-files-found: warn
+          retention-days: 14
