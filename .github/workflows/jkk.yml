@@ -39,18 +39,60 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # 👇 cache は外す（ロックファイルがないため）
+          # lockfileが無いので cache は使わない
           # cache: 'npm'
 
-      - name: Install system deps for Chromium
+      - name: Show base image
         run: |
+          uname -a
+          . /etc/os-release
+          echo "Image: $PRETTY_NAME"
+
+      - name: Install system libs (Jammy/Noble compatible)
+        run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
-            libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 \
-            libnss3 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
-            libxext6 libxfixes3 libxkbcommon0 libxrandr2 libxrender1 libxshmfence1 \
-            libpango-1.0-0 libpangocairo-1.0-0
+          # 候補リスト（存在するものだけ入れる）
+          PKGS="
+            ca-certificates
+            fonts-liberation
+            libatk-bridge2.0-0
+            libatk1.0-0
+            libcups2 libcups2t64
+            libdbus-1-3
+            libdrm2
+            libgbm1
+            libglib2.0-0
+            libgtk-3-0
+            libnspr4
+            libnss3
+            libx11-6
+            libx11-xcb1
+            libxcb1
+            libxcomposite1
+            libxcursor1
+            libxdamage1
+            libxext6
+            libxfixes3
+            libxkbcommon0
+            libxrandr2
+            libxrender1
+            libxshmfence1
+            libpango-1.0-0
+            libpangocairo-1.0-0
+            libasound2 libasound2t64
+          "
+          TO_INSTALL=()
+          for p in $PKGS; do
+            if apt-cache show "$p" >/dev/null 2>&1; then
+              TO_INSTALL+=("$p")
+            fi
+          done
+          if [ ${#TO_INSTALL[@]} -gt 0 ]; then
+            # 重複を除去（libcups2 / libcups2t64 のような両立候補が両方ある場合に対策）
+            mapfile -t UNIQUE < <(printf "%s\n" "${TO_INSTALL[@]}" | awk '!x[$0]++')
+            sudo apt-get install -y --no-install-recommends "${UNIQUE[@]}"
+          fi
 
       - name: Install dependencies
         run: npm i
