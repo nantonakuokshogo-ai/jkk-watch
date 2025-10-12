@@ -2,6 +2,9 @@ name: JKK Monitor
 on:
   workflow_dispatch:
     inputs:
+      kana:
+        description: '住宅名（カナ）で検索する語（例: コーシャハイム）'
+        required: false
       top_url:
         description: 'Override JKK top URL (optional)'
         required: false
@@ -24,10 +27,10 @@ jobs:
     timeout-minutes: 20
     env:
       CI: 'true'
+      JKK_HEADLESS: 'true'
+      JKK_KANA_QUERY: ${{ github.event.inputs.kana }}
       JKK_TOP_URL: ${{ github.event.inputs.top_url }}
       JKK_START_URL: ${{ github.event.inputs.start_url }}
-      # 失敗時の調査で GUI が要らないなら true のままでOK
-      JKK_HEADLESS: 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -35,9 +38,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # lockfile が無いので cache は未使用
 
-      # Noble/Jammy 両対応ライブラリ（存在する側だけ入れる）
+      # Noble/Jammy 両対応：存在する方だけ入れる（t64問題の回避）
       - name: Install system libs (portable)
         shell: bash
         run: |
