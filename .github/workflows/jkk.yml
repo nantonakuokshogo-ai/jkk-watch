@@ -1,6 +1,4 @@
-# .github/workflows/jkik.yml
 name: JKK Monitor
-
 on:
   workflow_dispatch:
     inputs:
@@ -10,9 +8,8 @@ on:
       start_url:
         description: 'Override JKK startinit URL (optional)'
         required: false
-  # JST 06:30（UTC 21:30）
   schedule:
-    - cron: '30 21 * * *'
+    - cron: '30 21 * * *' # JST 06:30
 
 permissions:
   contents: read
@@ -27,106 +24,49 @@ jobs:
     timeout-minutes: 20
     env:
       CI: 'true'
-      PUPPETEER_SKIP_DOWNLOAD: 'false'
       JKK_TOP_URL: ${{ github.event.inputs.top_url }}
       JKK_START_URL: ${{ github.event.inputs.start_url }}
+      # 失敗時の調査で GUI が要らないなら true のままでOK
+      JKK_HEADLESS: 'true'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # lockfileが無いので cache は使わない
-          # cache: 'npm'
+          # lockfile が無いので cache は未使用
 
-      - name: Show base image
-        shell: bash
-        run: |
-          uname -a
-          . /etc/os-release
-          echo "Image: $PRETTY_NAME"
-
-      - name: Install system libs (Jammy/Noble portable v3)
+      # Noble/Jammy 両対応ライブラリ（存在する側だけ入れる）
+      - name: Install system libs (portable)
         shell: bash
         run: |
           set -euxo pipefail
-          sudo apt-get update
-
-          # 最初に存在したものを選ぶヘルパ
-          choose() {
-            for n in "$@"; do
-              if apt-cache show "$n" >/dev/null 2>&1; then
-                echo "$n"
-                return 0
-              fi
-            done
-            return 1
-          }
-
+          sudo apt-get update -y
+          choose() { for n in "$@"; do apt-cache show "$n" >/dev/null 2>&1 && { echo "$n"; return; }; done; }
           PKGS=(
-            ca-certificates
-            fonts-liberation
-            libatk-bridge2.0-0
-            libatk1.0-0
-            "$(choose libcups2t64 libcups2 || true)"
-            libdbus-1-3
-            libdrm2
-            libgbm1
-            libglib2.0-0
-            libgtk-3-0
-            libnspr4
-            libnss3
-            libx11-6
-            libx11-xcb1
-            libxcb1
-            libxcomposite1
-            libxcursor1
-            libxdamage1
-            libxext6
-            libxfixes3
-            libxkbcommon0
-            libxrandr2
-            libxrender1
-            libxshmfence1
-            libpango-1.0-0
-            libpangocairo-1.0-0
+            ca-certificates fonts-liberation libatk-bridge2.0-0 libatk1.0-0
+            "$(choose libcups2t64 libcups2 || true)" libdbus-1-3 libdrm2 libgbm1
+            libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libx11-6 libx11-xcb1 libxcb1
+            libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxkbcommon0
+            libxrandr2 libxrender1 libxshmfence1 libpango-1.0-0 libpangocairo-1.0-0
             "$(choose libasound2t64 libasound2 || true)"
           )
-
-          # 空要素を除去
-          INSTALL=()
-          for p in "${PKGS[@]}"; do
-            if [ -n "$p" ]; then INSTALL+=("$p"); fi
-          done
-
-          if [ ${#INSTALL[@]} -gt 0 ]; then
-            sudo apt-get install -y --no-install-recommends "${INSTALL[@]}"
-          fi
+          INSTALL=(); for p in "${PKGS[@]}"; do [ -n "$p" ] && INSTALL+=("$p"); done
+          [ ${#INSTALL[@]} -gt 0 ] && sudo apt-get install -y --no-install-recommends "${INSTALL[@]}"
 
       - name: Install dependencies
         run: npm i
 
-      - name: Show versions
-        run: |
-          node -v
-          npm -v
-          npx puppeteer browsers || true
-
       - name: Run monitor
         run: |
           mkdir -p out
-          node monitor.mjs || echo "monitor exited with code $?"
+          node monitor.mjs || true
 
       - name: Upload artifacts (out/)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jkk-out-${{ github.run_id }}
-          path: |
-            out/**
-            package.json
-            monitor.mjs
+          path: out/**
           retention-days: 14
