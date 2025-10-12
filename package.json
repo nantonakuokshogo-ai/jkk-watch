@@ -1,11 +1,9 @@
+// 3) package.json
 {
-  "name": "jkk-kosha-search",
-  "version": "0.1.0",
+  "name": "jkk-monitor",
+  "version": "0.2.0",
   "type": "module",
-  "scripts": {
-    "start": "node jkk_search_kosha.mjs"
-  },
-  "dependencies": {
-    "playwright": "^1.45.0"
-  }
+  "private": true,
+  "scripts": { "monitor": "node monitor.mjs" },
+  "dependencies": { "puppeteer": "^22.13.1" }
 }
