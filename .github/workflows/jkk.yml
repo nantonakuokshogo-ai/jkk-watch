@@ -10,7 +10,7 @@ on:
       start_url:
         description: 'Override JKK startinit URL (optional)'
         required: false
-  # JST(UTC+9)の毎朝06:30に動かしたい場合 → 21:30 UTC
+  # JST 06:30（UTC 21:30）
   schedule:
     - cron: '30 21 * * *'
 
@@ -27,9 +27,7 @@ jobs:
     timeout-minutes: 20
     env:
       CI: 'true'
-      # Puppeteer に同梱の Chromium を落とさせる（デフォルトでOK）
       PUPPETEER_SKIP_DOWNLOAD: 'false'
-      # monitor.mjs で参照可能な任意の上書きURL
       JKK_TOP_URL: ${{ github.event.inputs.top_url }}
       JKK_START_URL: ${{ github.event.inputs.start_url }}
 
@@ -41,7 +39,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          # 👇 cache は外す（ロックファイルがないため）
+          # cache: 'npm'
 
       - name: Install system deps for Chromium
         run: |
@@ -59,6 +58,7 @@ jobs:
       - name: Show versions
         run: |
           node -v
+          npm -v
           npx puppeteer browsers || true
 
       - name: Run monitor
