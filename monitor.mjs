@@ -1,4 +1,4 @@
-// monitor.mjs (v5) — timeout復帰＆結果撮影を強化
+// monitor.mjs (v6) — navの戻りをPage化／タイムアウト復帰＆結果撮影を強化
 import fs from "fs";
 import path from "path";
 import puppeteer from "puppeteer";
@@ -12,7 +12,7 @@ const log = (...a) => {
 
 const TOPS = [
   process.env.JKK_TOP_URL?.trim(),
-  "https://www.to-kousya.or.jp/chintai/index.html", // 公式の賃貸トップ
+  "https://www.to-kousya.or.jp/chintai/index.html",
   "https://www.jkk-tokyo.or.jp/",
 ].filter(Boolean);
 
@@ -65,6 +65,14 @@ async function tryClickAny(page, selectors) {
   return await page.evaluate((sels) => {
     function visible(el){ const r = el.getBoundingClientRect?.(); return r && r.width>0 && r.height>0; }
     for (const sel of sels) {
+      // CSSに:containsは無いので素直にquerySelectorだけ試す
+      if (sel.startsWith("BUTTON_TEXT=")) {
+        const text = sel.replace("BUTTON_TEXT=","");
+        const btn = Array.from(document.querySelectorAll("button,input[type=button],input[type=submit]"))
+          .find(b => (b.innerText||b.value||"").includes(text));
+        if (btn && visible(btn)) { btn.click(); return sel; }
+        continue;
+      }
       const el = document.querySelector(sel);
       if (el && visible(el)) { el.click(); return sel; }
     }
@@ -99,12 +107,12 @@ async function isJyoukenPage(p) {
   return has;
 }
 async function isTimeoutPage(p) {
-  const title = await p.title().catch(()=> "");
-  if (/おわび|timeout|タイムアウト/i.test(title)) return true;
-  return await p.evaluate(() => {
-    const t = document.body?.innerText || "";
-    return /タイムアウト|おわび/.test(t);
-  });
+  try {
+    const canTitle = typeof p.title === "function";
+    const title = canTitle ? (await p.title()) : "";
+    if (/おわび|timeout|タイムアウト/i.test(title)) return true;
+  } catch {}
+  return await p.evaluate(() => /タイムアウト|おわび/.test(document.body?.innerText || ""));
 }
 async function isResultLike(p) {
   const u = (p.url() || "").toLowerCase();
@@ -130,11 +138,9 @@ async function recoverFromTimeout(currentPage) {
     await saveShot(currentPage, "after_backtop");
   }
 
-  // 2) 直接 StartInit を “参照元（Referer）付き”で開いてポップアップ待ち
+  // 2) StartInit を Referer 付きで直開き → ポップアップ待ち
   await currentPage.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
-  try {
-    await currentPage.goto(STARTS[0] || STARTS[1], { waitUntil: "domcontentloaded", timeout: 20000 });
-  } catch {}
+  try { await currentPage.goto(STARTS[0] || STARTS[1], { waitUntil: "domcontentloaded", timeout: 20000 }); } catch {}
   const p = await waitPopup(currentPage, 15000);
   if (p) {
     await saveShot(p, "popup_after_recover");
@@ -156,7 +162,8 @@ async function clickSearchLoose(p) {
     'img[alt*="検索"]',
     'input[type="image"][alt*="検索"]',
     'input[type="submit"][value*="検索"]',
-    'button:contains("検索")',
+    'input[type="button"][value*="検索"]',
+    'BUTTON_TEXT=検索',
   ]);
   if (!clicked) {
     await p.evaluate(() => { const f = document.querySelector("form"); f && f.submit && f.submit(); });
@@ -191,17 +198,17 @@ async function clickSearchStrict(p) {
   if (!ok) throw new Error("“検索する” ボタンに到達できませんでした。");
 }
 
+// ★ 修正ポイント：常に Page を返す
 async function waitNavOrNewTarget(p, timeout = 20000) {
   const browser = p.browser();
-  const navP = p.waitForNavigation({ waitUntil: "domcontentloaded", timeout }).catch(() => null);
-  const newT = browser.waitForTarget(
-    t => t.opener() === p.target(),
-    { timeout }
-  ).then(t => t?.page().catch(() => null)).catch(() => null);
-
-  const res = await Promise.race([navP, newT]);
-  if (res && res !== true) return res; // new page
-  return p; // same page navigated
+  const navToSamePage = p.waitForNavigation({ waitUntil: "domcontentloaded", timeout })
+    .then(() => p)
+    .catch(() => null);
+  const newPage = browser.waitForTarget(t => t.opener() === p.target(), { timeout })
+    .then(t => t?.page().catch(() => null))
+    .catch(() => null);
+  const res = await Promise.race([navToSamePage, newPage]);
+  return res || p;
 }
 
 async function captureResult(p) {
@@ -210,13 +217,10 @@ async function captureResult(p) {
   await saveShot(p, resultLike ? "result_list" : "result_fallback");
   await saveHTML(p, resultLike ? "result_list" : "result_fallback");
 
-  // frame内のテキスト用に、主要フレームも保存（可能なら）
+  // 可能ならフレームも保存
   const frames = p.frames().filter(f => f !== p.mainFrame());
   for (let i = 0; i < frames.length; i++) {
-    try {
-      const html = await frames[i].content();
-      fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html);
-    } catch {}
+    try { const html = await frames[i].content(); fs.writeFileSync(path.join(OUT, `frame_${i}.html`), html); } catch {}
   }
 }
 
@@ -225,14 +229,15 @@ async function runSearch(p) {
   await ensureViewport(p);
   await S(300);
   await saveShot(p, "popup_open");
-  const onMap = await isMapPage(p);
-  const onJyouken = onMap ? false : await isJyoukenPage(p);
 
   if (await isTimeoutPage(p)) {
     const recovered = await recoverFromTimeout(p);
     if (!recovered) throw new Error("タイムアウト復帰に失敗しました。");
     p = recovered;
   }
+
+  const onMap = await isMapPage(p);
+  const onJyouken = onMap ? false : await isJyoukenPage(p);
 
   if (onMap) {
     await saveHTML(p, "popup_map");
@@ -245,11 +250,9 @@ async function runSearch(p) {
     await clickSearchLoose(p);
   }
 
-  const after = await waitNavOrNewTarget(p, 25000);
+  p = await waitNavOrNewTarget(p, 25000);
   await S(400);
-  if (after && after !== p) {
-    p = after;
-  }
+
   if (await isTimeoutPage(p)) {
     const recovered = await recoverFromTimeout(p);
     if (!recovered) throw new Error("検索後にタイムアウト画面。復帰失敗。");
@@ -272,7 +275,6 @@ async function submitServicePOST(page) {
 }
 
 async function openServiceDirect(page) {
-  // 直接開くときも referer を付与
   await page.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
   const p = await submitServicePOST(page);
   if (!p) throw new Error("Service 直POSTでの起動に失敗しました。");
@@ -283,7 +285,6 @@ async function launchFromStart(page) {
   await saveShot(page, "landing");
   await saveHTML(page, "landing");
 
-  // 可能なら「空家情報」への導線をクリック（ポップアップ想定）
   const clicked = await tryClickAny(page, [
     'a[href*="akiyachizuStartInit"]',
     'a[href*="akiyaStartInit"]',
@@ -293,11 +294,8 @@ async function launchFromStart(page) {
   ]);
 
   let p = null;
-  if (clicked) {
-    p = await waitPopup(page, 15000);
-  }
+  if (clicked) p = await waitPopup(page, 15000);
   if (!p) {
-    // クリック検出できなかった場合は、StartInitをreferer付きで直開き
     await page.setExtraHTTPHeaders({ Referer: "https://www.to-kousya.or.jp/chintai/index.html" });
     try { await page.goto(STARTS[0] || STARTS[1], { waitUntil: "domcontentloaded", timeout: 20000 }); } catch {}
     p = await waitPopup(page, 15000);
@@ -341,7 +339,6 @@ async function main() {
   const page = await browser.newPage();
   await ensureViewport(page);
 
-  // まずは to-kousya 側のトップ〜StartInitを優先
   const top = await gotoByCandidates(page, TOPS, "entry_referer");
   if (!top.ok) {
     const start = await gotoByCandidates(page, STARTS, "startinit_direct");
