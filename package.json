@@ -1,12 +1,14 @@
 {
   "name": "jkk-watch",
   "version": "0.3.0",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
-    "start": "node monitor.mjs"
+    "start": "node monitor.mjs",
+    "install:pw": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
-    "playwright": "^1.47.2"
+    "playwright": "^1.47.2",
+    "fs-extra": "^11.2.0"
   }
 }
