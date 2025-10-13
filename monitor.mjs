@@ -5,6 +5,41 @@ import fs from 'fs/promises';
 const WORD = process.env.JKK_WORD || 'コーシャハイム'; // 住宅名（カナ）に入れる検索ワード
 const ART_DIR = 'artifacts';
 
+// ===== 新規: DNSゆらぎ対策つき goto =====
+const LANDING_CANDIDATES = [
+  'https://www.jkk-portal.jp/',
+  'https://jkk-portal.jp/',
+  'http://www.jkk-portal.jp/',
+  'http://jkk-portal.jp/',
+];
+
+async function gotoWithRetries(page, urls, { tries = 4, waitUntil = 'domcontentloaded' } = {}) {
+  let lastErr;
+  for (const url of urls) {
+    for (let i = 1; i <= tries; i++) {
+      try {
+        console.log(`[goto] (${i}/${tries}) ${url}`);
+        await page.goto(url, { waitUntil, timeout: 25000 });
+        return url;
+      } catch (err) {
+        lastErr = err;
+        const msg = (err && err.message) || '';
+        // DNSエラーや一時的なネットワーク系のみリトライ
+        if (/ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|net::ERR/.test(msg)) {
+          const backoff = 800 * i;
+          console.log(`[goto-retry] ${url} -> ${msg.trim()} (sleep ${backoff}ms)`);
+          await page.waitForTimeout(backoff);
+          continue;
+        }
+        // それ以外は次のURLへ
+        console.log(`[goto-skip] ${url} -> ${msg.trim()}`);
+        break;
+      }
+    }
+  }
+  throw lastErr || new Error('goto failed (no detail)');
+}
+
 async function ensureDir(p) {
   await fs.mkdir(p, { recursive: true }).catch(() => {});
 }
@@ -60,12 +95,12 @@ async function fillIfVisible(root, candidates, value) {
   page.setDefaultTimeout(20000);
 
   try {
-    console.log('[step] goto landing');
-    await page.goto('https://www.jkk-portal.jp/', { waitUntil: 'domcontentloaded' });
+    console.log('[step] goto landing (with DNS retries)');
+    await gotoWithRetries(page, LANDING_CANDIDATES, { tries: 3 });
     await page.waitForLoadState('networkidle').catch(() => {});
     await savePage(page, 'landing');
 
-    // クッキーバナー等を閉じる（出ない時もある）
+    // クッキーバナー等を閉じる
     await clickIfVisible(page, [
       'text=閉じる',
       'button:has-text("閉じる")',
@@ -75,7 +110,6 @@ async function fillIfVisible(root, candidates, value) {
     console.log('[step] open conditions (こだわり条件)');
     const popupPromise = page.waitForEvent('popup', { timeout: 8000 }).catch(() => null);
 
-    // 「こだわり条件」クリック
     const opened =
       (await clickIfVisible(page, [
         'text=こだわり条件',
@@ -84,58 +118,38 @@ async function fillIfVisible(root, candidates, value) {
         'a:has-text("こだわり条件")',
       ])) || false;
 
-    if (!opened) {
-      throw new Error('こだわり条件のクリックに失敗しました（セレクタ未一致）');
-    }
+    if (!opened) throw new Error('こだわり条件のクリックに失敗しました（セレクタ未一致）');
 
-    // ① popup か、② 同タブ遷移か、③ iframe 表示か —— いずれにも対応
     let condPage = await popupPromise;
     if (condPage) {
       console.log('[popup] captured new window');
       await condPage.waitForLoadState('domcontentloaded').catch(() => {});
     } else {
-      // 同タブや遷移の場合
-      console.log('[popup] not fired, fallback to current context pages / navigation');
-      // 少し待って new page が増えていないか確認
+      console.log('[popup] not fired, fallback to same-tab/iframe');
       await page.waitForTimeout(1200);
-
-      // 新しいページが開いているか確認
       const others = context.pages().filter(p => p !== page);
       condPage =
         others.find(p => /entry|popup|search|kodawari|jyouken|akiyake/i.test(p.url())) || page;
-
-      // 何かしらの遷移が起きるまで軽く待機
       await condPage.waitForLoadState('domcontentloaded').catch(() => {});
     }
 
-    // 条件画面の候補: そのまま or iframe 内
-    // iframe を含むページ想定で、frameLocator を先に試す
     const roots = [condPage.frameLocator('iframe'), condPage];
 
-    console.log('[step] try to locate "住宅名（カナ）" field and fill keyword');
+    console.log('[step] fill "住宅名（カナ）" and search');
     let filled = false;
     for (const root of roots) {
-      // ラベル名ベース & 幅広い入力候補
       const textFieldSelectors = [
-        // ARIA/ラベル系
         'input[aria-label*="住宅名"][aria-label*="カナ"]',
         'input[aria-label*="カナ"][aria-label*="住宅名"]',
         'role=textbox[name*="住宅名"][name*="カナ"]',
-        // ラベルテキストでの関連（Playwright の getByRole の後方互換）
         'xpath=//label[contains(., "住宅名") and contains(., "カナ")]/following::input[1]',
-        // 最後の手段：テキストボックスのうち先頭のもの（他フィールドが少ない前提）
         'input[type="text"]',
       ];
-
       try {
         filled = await fillIfVisible(root, textFieldSelectors, WORD);
         if (filled) {
           console.log(`[filled] 住宅名（カナ）に "${WORD}" を入力`);
-          // 一応スクショ
-          try {
-            await savePage(condPage, 'jyouken_filled');
-          } catch {}
-          // 検索ボタンをクリック
+          await savePage(condPage, 'jyouken_filled');
           const clicked =
             (await clickIfVisible(root, [
               'text=検索する',
@@ -143,35 +157,24 @@ async function fillIfVisible(root, candidates, value) {
               'role=button[name="検索する"]',
               'input[type="submit"][value*="検索"]',
             ])) || false;
-
-          if (!clicked) {
-            console.warn('[warn] 検索ボタンが見つからず、代替クリック失敗');
-          }
+          if (!clicked) console.warn('[warn] 検索ボタンが見つからず、代替クリック失敗');
           break;
         }
-      } catch (e) {
-        // 別 root を試す
-      }
+      } catch {}
     }
 
-    if (!filled) {
-      console.warn('[warn] 住宅名（カナ）入力に失敗（セレクタ未一致の可能性）');
-      // それでも次へ進む（一覧に辿れるケースがある）
-    }
+    if (!filled) console.warn('[warn] 住宅名（カナ）入力に失敗（セレクタ未一致の可能性）');
 
     console.log('[step] wait for result list (any page/list view)');
-    // 結果は同ウィンドウ or 別ウィンドウの可能性
-    // 少し待ってページ候補を再取得
     await condPage.waitForTimeout(2000);
 
-    // 一番それらしいページを選ぶ
     const pickResultPage = () => {
       const all = context.pages();
-      // URL ヒューリスティック
-      const byUrl =
+      return (
         all.find(p => /result|list|kensaku|ichiran|akiyake/i.test(p.url())) ||
-        all.find(p => /popup|search|kodawari/i.test(p.url()));
-      return byUrl || condPage;
+        all.find(p => /popup|search|kodawari/i.test(p.url())) ||
+        condPage
+      );
     };
 
     let resultPage = pickResultPage();
@@ -184,12 +187,9 @@ async function fillIfVisible(root, candidates, value) {
   } catch (err) {
     console.error('[fatal]', err);
     try {
-      // 何か残っていれば最後のページを保存
       const last = context.pages().at(-1);
-      if (last) {
-        await savePage(last, 'last_page_fallback');
-      }
-    } catch (_) {}
+      if (last) await savePage(last, 'last_page_fallback');
+    } catch {}
     await browser.close();
     process.exit(1);
   }
