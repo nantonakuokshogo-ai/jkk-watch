@@ -1,135 +1,164 @@
 // monitor.mjs
 import { chromium } from 'playwright';
-import fs from 'fs/promises';
-import path from 'path';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
-const OUT = 'artifacts';
-const JKK_TOP = 'https://www.to-kousya.or.jp/chintai/';
+const OUT = process.env.ARTIFACT_DIR || 'artifacts';
+const NOW = new Date().toISOString().replace(/[:.]/g, '-');
 
-async function ensureDir(d) { await fs.mkdir(d, { recursive: true }); }
-function ts() {
-  const d = new Date();
-  const z = n => `${n}`.padStart(2, '0');
-  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}T${z(d.getHours())}-${z(d.getMinutes())}-${z(d.getSeconds())}`;
-}
-async function save(page, name) {
-  await ensureDir(OUT);
-  const t = `${name}_${ts()}`;
-  await fs.writeFile(path.join(OUT, `${t}.html`), await page.content(), { encoding: 'utf8' });
-  await page.screenshot({ path: path.join(OUT, `${t}.png`), fullPage: true });
-}
+const step = (label) => {
+  const t = new Date().toISOString();
+  console.log(`[${t}] ${label}`);
+};
 
-async function withTimeout(promise, ms, label) {
-  let to;
-  const timer = new Promise((_, rej) => (to = setTimeout(() => rej(new Error(`Timeout: ${label} (${ms}ms)`)), ms)));
-  try { return await Promise.race([promise, timer]); }
-  finally { clearTimeout(to); }
-}
+const savePage = async (page, name) => {
+  const base = path.join(OUT, `${name}`);
+  await fs.mkdir(OUT, { recursive: true }).catch(() => {});
+  await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
+  await fs.writeFile(`${base}.html`, await page.content()).catch(() => {});
+};
 
-function isOwabiHtml(html) {
-  return html.includes('JKKねっと：おわび') || html.includes('/search/jkknet/images/owabi');
-}
+const ABORT_PATTERNS = [
+  'googletagmanager.com', 'google-analytics.com', 'doubleclick.net',
+  'analytics.tiktok.com', 'connect.facebook.net', 'cdn.smartnews-ads.com',
+  'js.fout.jp', 's.yimg.jp', 'static.ads-twitter.com', 'cdn.microad.jp'
+];
 
-async function runOnce() {
-  const browser = await chromium.launch({ headless: true });
+// 個別操作タイムアウト（ミリ秒）
+const T = {
+  nav: 25_000,
+  tiny: 5_000,
+  short: 8_000,
+  mid: 12_000
+};
+
+// 全体強制タイムアウト（念のため）
+const hardKill = setTimeout(() => {
+  console.error('Hard timeout reached. Exiting with code 2.');
+  process.exit(2);
+}, 5 * 60 * 1000);
+
+(async () => {
+  // 失敗時のトレースを必ず残す
+  await fs.mkdir(OUT, { recursive: true }).catch(() => {});
+  const tracePath = 'trace.zip';
+
+  const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
   const context = await browser.newContext({
-    locale: 'ja-JP',
-    timezoneId: 'Asia/Tokyo',
+    viewport: { width: 1440, height: 900 },
     userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36'
   });
-  // 軽量化（速度＝タイムアウト対策）
+
+  // 軽量化：解析タグ・広告は全部キャンセル
   await context.route('**/*', (route) => {
-    const type = route.request().resourceType();
-    if (['image', 'font', 'media'].includes(type)) return route.abort();
+    const url = route.request().url();
+    if (ABORT_PATTERNS.some((d) => url.includes(d))) return route.abort();
     route.continue();
   });
 
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+
   const page = await context.newPage();
-  page.setDefaultTimeout(20_000);
-  page.setDefaultNavigationTimeout(25_000);
 
   try {
     // 1) トップへ
-    await withTimeout(page.goto(JKK_TOP, { waitUntil: 'domcontentloaded' }), 25_000, 'goto top');
-    await save(page, 'landing');
+    step('Goto: /chintai/');
+    await page.goto('https://www.to-kousya.or.jp/chintai/', { waitUntil: 'domcontentloaded', timeout: T.nav });
+    await savePage(page, `landing_${NOW}`);
 
-    // 2) 「JKKねっと」クリック → ポップアップ捕捉（entry_referer → popup_top）
-    const [popup] = await withTimeout(Promise.all([
-      page.waitForEvent('popup'),
-      page.getByRole('link', { name: /JKKねっと/ }).click()
-    ]), 20_000, 'open popup');
-
-    await withTimeout(popup.waitForLoadState('domcontentloaded'), 20_000, 'popup load');
-    await save(popup, 'entry_referer');
-
-    // entry_referer が自動遷移して popup_top に到達するまで待機
-    await withTimeout(popup.waitForURL(/\/search\/jkknet\/.*(top|search).*\.html/i), 20_000, 'redirect to popup_top');
-    await save(popup, 'popup_top');
-
-    // 「先着順あき家検索」へ（同一ウィンドウ遷移）
-    // a要素のテキストが環境差分で揺れるため href 部分で取得
-    const senchaku = popup.locator('a[href*="senchakujun"] , a:has-text("先着順あき家検索")').first();
-    await withTimeout(Promise.all([
-      popup.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-      senchaku.click()
-    ]), 20_000, 'go to search');
-
-    // 3) フレーム(main)の検索フォームに「住宅名（カナ）」入力
-    const main = await withTimeout(
-      popup.waitForSelector('frame[name="main"]'), 20_000, 'wait main frame'
-    );
-    const frame = await popup.frame({ name: 'main' });
-    if (!frame) throw new Error('main frame not found');
-
-    // 大きいテキスト枠（住宅名（カナ））を特定：label 近辺 or 最初の text input 行
-    // 画面が古いHTMLなので name 属性にフォールバック
-    const kanaInput =
-      frame.locator('input[type="text"]').first();
-
-    await withTimeout(kanaInput.waitFor(), 10_000, 'kana input appear');
-    await kanaInput.fill('コーシャハイム');
-    await save(popup, 'jyouken_filled');
-
-    // 4) 「検索する」クリック → 結果一覧へ
-    const searchBtn = frame.getByRole('button', { name: /検索する/ }).first()
-      .or(frame.locator('input[type="image"][alt="検索する"] , input[type="submit"][value*="検索"]'));
-
-    await withTimeout(Promise.all([
-      popup.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-      searchBtn.click()
-    ]), 25_000, 'submit search');
-
-    // 5) 結果確認 & 保存
-    const html = await popup.content();
-    if (isOwabiHtml(html)) {
-      await save(popup, 'owabi');
-      throw new Error('Server returned "おわび" (session/route invalid).');
+    // クッキーバナー「閉じる」が出ることがあるので閉じる（無ければ無視）
+    const cookieClose = page.locator('text=閉じる');
+    if (await cookieClose.first().isVisible({ timeout: 1000 }).catch(() => false)) {
+      step('Close cookie banner');
+      await cookieClose.first().click({ timeout: T.tiny }).catch(() => {});
     }
 
-    // “詳細” や 一覧テーブルを軽く確認
-    await withTimeout(popup.locator('text=詳細').first().waitFor({ state: 'visible' }).catch(() => Promise.resolve()), 5_000, 'result probe');
-    await save(popup, 'result_list');
+    // 2) 「こだわり条件」→ 旧サイトのポップアップを待つ
+    step('Open 条件検索 popup');
+    const [popup] = await Promise.all([
+      page.waitForEvent('popup', { timeout: T.mid }),
+      page.getByRole('link', { name: /こだわり条件/ }).click({ timeout: T.short })
+    ]);
 
-    await browser.close();
-    return { ok: true };
+    await popup.waitForLoadState('domcontentloaded', { timeout: T.nav });
+    await savePage(popup, `popup_top_${NOW}`);
+
+    // 3) 条件入力フレームへ（ページがフレーム構成なので総当たりで探す）
+    step('Find 条件入力 frame');
+    const findConditionFrame = async () => {
+      for (const f of popup.frames()) {
+        const body = await f.evaluate(() => document.body?.innerText || '');
+        if (/先着順あき家検索/.test(body)) return f;
+        if (/住宅名/.test(body) && /カナ/.test(body)) return f;
+      }
+      return null;
+    };
+
+    let cond = await findConditionFrame();
+    // もしトップで「検索方法」だけ等が表示されている場合、検索本体へのリンクをクリックしてから再検出
+    if (!cond) {
+      const anySearchLink = popup.getByRole('link', { name: /検索|先着|条件|あき家/ });
+      if (await anySearchLink.first().isVisible({ timeout: 1000 }).catch(() => false)) {
+        await anySearchLink.first().click({ timeout: T.short }).catch(() => {});
+        await popup.waitForLoadState('domcontentloaded', { timeout: T.mid }).catch(() => {});
+      }
+      cond = await findConditionFrame();
+    }
+
+    if (!cond) throw new Error('条件入力フレームが見つかりませんでした');
+
+    await savePage(popup, `jyouken_page_${NOW}`);
+
+    // 4) 「住宅名（カナ）」に 'コーシャハイム' を入力して検索
+    step('Fill 住宅名(カナ) and search');
+
+    // ラベルの直後の input を Xpath で頑強に取得（name 属性が安定していないため）
+    const kanaInput = cond.locator(
+      'xpath=//*[contains(normalize-space(.),"住宅名") and contains(normalize-space(.),"カナ")]/following::input[1]'
+    );
+
+    await kanaInput.fill('コーシャハイム', { timeout: T.mid });
+    await savePage(popup, `jyouken_filled_${NOW}`);
+
+    // 「検索する」ボタン押下（テキスト or 画像ボタン両対応）
+    const searchBtn =
+      cond.getByRole('button', { name: /検索/ }).first() ||
+      cond.getByRole('link', { name: /検索/ }).first() ||
+      cond.locator('input[type="submit"], input[type="image"]').first();
+
+    await Promise.all([
+      popup.waitForLoadState('domcontentloaded', { timeout: T.nav }),
+      searchBtn.click({ timeout: T.short })
+    ]);
+
+    // 5) 結果一覧ページ（先着順あき家検索の表）を撮る
+    step('Capture result list');
+    // ページorフレームどちらにも出る可能性があるので広めに探索
+    let resultFrame = null;
+    for (const f of popup.frames()) {
+      const body = await f.evaluate(() => document.body?.innerText || '');
+      if (/先着順あき家検索/.test(body) && /詳細/.test(body)) {
+        resultFrame = f;
+        break;
+      }
+    }
+    if (resultFrame) {
+      await savePage(resultFrame, `result_list_${NOW}`);
+    } else {
+      await savePage(popup, `result_list_${NOW}`); // 直下に出た場合
+    }
+
+    step('Done');
+
   } catch (e) {
-    console.error('[ERROR]', e.message);
-    await save(page, 'last_page_fallback');
-    await browser.close();
-    return { ok: false, error: e };
-  }
-}
-
-(async () => {
-  await ensureDir(OUT);
-  // 最大2回まで自動リトライ（「おわび」対策）
-  for (let i = 1; i <= 2; i++) {
-    console.log(`--- attempt ${i} ---`);
-    const res = await runOnce();
-    if (res.ok) return;
-    if (i === 2) process.exit(1);
-    // 短いクールダウン
-    await new Promise(r => setTimeout(r, 1500));
+    console.error('ERROR:', e);
+    await savePage(page, `last_page_fallback_${NOW}`).catch(() => {});
+    await savePage(page, `last_page_fallback2_${Date.now()}`).catch(() => {});
+    process.exitCode = 1;
+  } finally {
+    await context.tracing.stop({ path: 'trace.zip' }).catch(() => {});
+    await browser.close().catch(() => {});
+    clearTimeout(hardKill);
   }
 })();
