@@ -1,42 +1,45 @@
-name: jkk-watch
+name: jkk
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 23 * * *"   # 任意で変更
+    inputs:
+      kana:
+        description: "住宅名（カナ）に入れる語（例：コーシャハイム あるいは ｺｰｼｬﾊｲﾑ）"
+        required: false
+        default: "コーシャハイム"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"      # ← cacheは付けない（lockfile無いので）
+          node-version: '20'
+          # ※ロックファイル無しでOKにするため cache は使わない
 
       - name: Install npm deps
-        run: npm install --no-fund --no-audit
+        run: npm install
 
       - name: Install Playwright (browsers + system deps)
-        run: npx --yes playwright@latest install --with-deps chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Run script
         env:
-          JKK_SEARCH_KANA: "コーシャハイム"
-          OUT_DIR: "artifacts"
-          DEBUG: "pw:api"
+          SEARCH_KANA: ${{ github.event.inputs.kana }}
         run: |
           mkdir -p artifacts
-          node monitor.mjs || true
+          node monitor.mjs
 
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-artifacts-${{ github.run_id }}
-          path: artifacts/**
-          retention-days: 14
-        
+          name: jkk-${{ github.run_number }}
+          path: artifacts
+          if-no-files-found: warn
