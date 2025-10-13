@@ -4,9 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node monitor.mjs",
-    "install:pw": "npx playwright install --with-deps chromium",
-    "test:local": "node monitor.mjs"
+    "start": "node monitor.mjs"
   },
   "dependencies": {
     "playwright": "^1.47.2"
