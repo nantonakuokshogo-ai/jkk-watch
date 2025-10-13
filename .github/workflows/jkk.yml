@@ -1,37 +1,48 @@
-name: jkk-watch
+name: jkk
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 0 * * *"  # 毎日09:30JST くらい
+  push:
+    paths:
+      - 'monitor.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/jkk.yml'
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'   # ← package-lock.json が必須。なければこの行を消す
+          cache: 'npm'
 
       - name: Install deps
         run: |
           npm ci --no-audit --no-fund
-          npm run install:pw
+
+      - name: Install Playwright (browsers + system deps)
+        run: |
+          npx playwright install --with-deps
 
       - name: Run script
         run: |
           mkdir -p artifacts
           node monitor.mjs
-        env:
-          CI: true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
-          path: artifacts/
-          if-no-files-found: ignore
+          name: jkk-artifacts
+          path: |
+            artifacts/**
+            *.png
+            *.html
+            *.log
+          if-no-files-found: warn
