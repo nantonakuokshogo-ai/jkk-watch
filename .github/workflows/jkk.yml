@@ -3,40 +3,58 @@ name: jkk-watch
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 */3 * * *"  # 3時間おき（お好みで変更可）
+    # 毎日 08:30 JST（23:30 UTC）に回す例。お好みで調整してください
+    - cron: "30 23 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jkk-watch
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+
+    env:
+      DEBUG: pw:api
+      NODE_OPTIONS: --unhandled-rejections=strict
+      ARTIFACT_DIR: artifacts
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
+          cache: npm
 
       - name: Install npm deps
-        run: npm install
+        run: |
+          npm ci
 
-      # 公式CLIでブラウザ＋必要OS依存をまとめて導入（Ubuntu 24.04対応）
       - name: Install Playwright (browsers + system deps)
-        run: npx --yes playwright@latest install --with-deps chromium
+        run: |
+          npx playwright install --with-deps chromium
 
       - name: Run script
-        env:
-          JKK_SEARCH_KANA: "コーシャハイム"   # ← 必要なenvを入れる（空にしない）
-          OUT_DIR: "artifacts"
-          # DEBUG: "pw:api"                 # 追加ログが欲しい時だけコメント解除
         run: |
-          mkdir -p artifacts
-          node monitor.mjs || true
+          mkdir -p "$ARTIFACT_DIR"
+          node monitor.mjs
 
-      - name: Upload artifacts (screenshots, HTML, trace.zip)
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-artifacts-${{ github.run_id }}
-          path: artifacts/**
-          retention-days: 14
+          name: jkk-artifacts
+          path: |
+            artifacts/**
+            debug.log
+            *.html
+            *.png
+            trace.zip
+          if-no-files-found: ignore
