@@ -1,167 +1,186 @@
 // monitor.mjs
-// Playwright ESM
-import { chromium } from "playwright";
-import fs from "fs/promises";
+import { chromium } from 'playwright';
+import fs from 'node:fs/promises';
 
-const OUT = "artifacts";
+const OUTDIR = 'artifacts';
+const SLOWMO = process.env.SLOWMO ? Number(process.env.SLOWMO) : 0;
 
-// ---------- helpers ----------
-async function saveHtml(page, name) {
-  try {
-    const html = await page.content();
-    await fs.writeFile(`${OUT}/${name}.html`, html, "utf8");
-  } catch (e) {
-    console.error(`[warn] saveHtml ${name}:`, e);
-  }
+async function save(page, base) {
+  const html = await page.content(); // ← Promiseをawaitして中身を渡す
+  await fs.mkdir(OUTDIR, { recursive: true });
+  await fs.writeFile(`${OUTDIR}/${base}.html`, html);
+  await page.screenshot({ path: `${OUTDIR}/${base}.png`, fullPage: true });
 }
 
-async function shot(page, name) {
-  try {
-    await page.screenshot({ path: `${OUT}/${name}.png`, fullPage: true });
-  } catch (e) {
-    console.error(`[warn] screenshot ${name}:`, e);
-  }
-}
-
-async function safeClick(page, locator, opt = {}) {
-  const l = page.locator(locator).first();
-  if (await l.count() === 0) return false;
-  try {
-    await l.scrollIntoViewIfNeeded();
-    await l.waitFor({ state: "visible", timeout: opt.timeout ?? 3000 });
-  } catch {}
-  try {
-    await l.click({ timeout: opt.timeout ?? 3000 });
-    return true;
-  } catch (e) {
-    // 最後の手段: DOM click
-    try {
-      const clicked = await l.evaluate((el) => {
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        return true;
+async function closeOverlays(page) {
+  // クッキーバナー
+  const cookieClose = page.getByRole('button', { name: /閉じる|同意|OK/i }).first();
+  if (await cookieClose.isVisible().catch(() => false)) await cookieClose.click().catch(() => {});
+  // 下部のチャット／バナー類を片付け（クリックの邪魔をしがち）
+  await page.evaluate(() => {
+    for (const sel of [
+      '#chatplusview',                           // よくあるチャット
+      '[id*="MediaTalk"]', '[class*="MediaTalk"]',
+      'div[role="dialog"]',
+      '.cookie', '.cookies', '[class*="cookie"]',
+      '[class*="banner"]', '[id*="banner"]',
+      'iframe'
+    ]) {
+      document.querySelectorAll(sel).forEach(el => {
+        try { el.style.pointerEvents = 'none'; el.style.display = 'none'; } catch {}
       });
-      return clicked;
-    } catch {}
+    }
+  }).catch(() => {});
+}
+
+async function gotoLanding(page) {
+  // 総合トップに入る（失敗時は賃貸トップにフォールバック）
+  const tried = [
+    'https://www.to-kousya.or.jp/',
+    'https://www.to-kousya.or.jp/chintai/index.html',
+  ];
+  for (const url of tried) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await closeOverlays(page);
+      await save(page, 'landing');
+      return;
+    } catch (e) {
+      // 次のURLへ
+    }
+  }
+  throw new Error('トップページへの遷移に失敗しました');
+}
+
+/** 文字を頼りにクリック。role/label/text/contains など複数パターンで当てに行く */
+async function clickByTextRobust(page, text) {
+  const trials = [
+    () => page.getByRole('button', { name: new RegExp(text) }),
+    () => page.getByRole('link',   { name: new RegExp(text) }),
+    () => page.getByLabel(new RegExp(text)),
+    () => page.locator(`text=${text}`),
+    () => page.locator(`:is(button,a,div,span,label) :text("${text}")`).first(),
+  ];
+  for (const make of trials) {
+    const loc = make();
+    try {
+      await loc.first().scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {});
+      if (await loc.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+        await loc.first().click({ timeout: 2000 }).catch(async () => {
+          // 被り物があれば強行
+          await loc.first().click({ timeout: 2000, force: true });
+        });
+        return true;
+      }
+    } catch { /* 次へ */ }
   }
   return false;
 }
 
-async function closeObstacles(page) {
-  // Cookieバー（「閉じる」「同意する」など）
-  for (const text of ["閉じる", "同意する", "同意して続行", "OK"]) {
-    const ok = await safeClick(page, `:is(button, a, div, span):has-text("${text}")`, { timeout: 1000 });
-    if (ok) break;
-  }
-  // チャット/モーダル(右下)をできるだけ閉じる
-  await page.evaluate(() => {
-    const sel = ['[aria-label="閉じる"]', '.close', '.mf_close', '.js-close'];
-    for (const s of sel) document.querySelectorAll(s).forEach((n) => n.click?.());
-  }).catch(() => {});
-}
-
-// ---------- steps ----------
-async function gotoChintaiTop(page) {
-  console.log("[step] goto top -> chintai");
-  await page.goto("https://www.to-kousya.or.jp/", { waitUntil: "domcontentloaded" });
-  await closeObstacles(page);
-  await shot(page, "landing");
-  await saveHtml(page, "landing");
-
-  // ヘッダーの「賃貸住宅情報」へ
-  // 1) 直接リンク（最も確実）
-  await page.goto("https://www.to-kousya.or.jp/chintai/index.html", { waitUntil: "domcontentloaded" });
-  await closeObstacles(page);
-  await shot(page, "chintai_top");
-  await saveHtml(page, "chintai_top");
-}
-
+/** こだわり条件 → 条件検索画面へ。複数ルートで到達を試みる */
 async function openConditions(page) {
-  console.log("[step] open conditions (こだわり条件)");
-  // ヒーローの「こだわり条件」ボタン（いくつかの表記/ロールに対応）
-  const selectors = [
-    'a:has-text("こだわり条件")',
-    'button:has-text("こだわり条件")',
-    'role=link[name=/こだわり条件/]',
-    'role=button[name=/こだわり条件/]',
-  ];
-  let clicked = false;
-  for (const s of selectors) {
-    clicked = await safeClick(page, s, { timeout: 2500 });
-    if (clicked) break;
-  }
-  if (!clicked) throw new Error("こだわり条件のリンクが見つかりませんでした");
-
-  // 遷移待ち & 邪魔除去
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await closeObstacles(page);
-  await shot(page, "after_click_kodawari");
-  await saveHtml(page, "after_click_kodawari");
-
-  // 3パターンの着地をハンドリング:
-  // A) 自動遷移待ちページ（「数秒後に自動で次の画面が表示されます。」）
-  if ((await page.content()).includes("数秒後に自動で") || (await page.getByText("こちら").count()) > 0) {
-    await safeClick(page, 'a:has-text("こちら")', { timeout: 3000 });
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
+  // まずはそのまま「こだわり条件」を叩く
+  if (await clickByTextRobust(page, 'こだわり条件')) {
+    // 遷移待ち
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+    await closeOverlays(page);
+    // 条件画面らしき文字（先着順あき家検索 / 条件から検索 等）を確認
+    const ok = await Promise.race([
+      page.waitForSelector('text=先着順あき家検索', { timeout: 6000 }).then(() => true).catch(() => false),
+      page.waitForSelector('text=条件から検索',     { timeout: 6000 }).then(() => true).catch(() => false),
+    ]);
+    await save(page, 'conditions_or_list');
+    if (ok) return true;
   }
 
-  // B) エリア（青い地図）ページ → 右上「条件から検索」
-  if ((await page.content()).includes("先着順あき家検索") && (await page.getByText("条件から検索").count()) > 0) {
-    await safeClick(page, 'a:has-text("条件から検索")', { timeout: 3000 });
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
+  // メニュー経由（「住宅をお探しの方」→ 賃貸住宅情報TOP）
+  const menuOpened =
+    (await clickByTextRobust(page, '住宅をお探しの方')) ||
+    (await clickByTextRobust(page, '賃貸住宅情報'));
+  if (menuOpened) {
+    await clickByTextRobust(page, '賃貸住宅情報トップ').catch(() => {});
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+    await closeOverlays(page);
+    await save(page, 'chintai_top');
+    // ここから「こだわり」「条件から探す」などを再トライ
+    if (await clickByTextRobust(page, 'こだわり条件') || await clickByTextRobust(page, '条件から探す') || await clickByTextRobust(page, '条件から検索')) {
+      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+      await closeOverlays(page);
+      await save(page, 'conditions_or_list');
+      return true;
+    }
   }
 
-  // C) そのまま条件フォームに着地（チェックボックス一杯のページ）
-  await closeObstacles(page);
-  await shot(page, "conditions_or_list");
-  await saveHtml(page, "conditions_or_list");
-
-  // もし誤って物件一覧（カード並び）に落ちたら、そのまま完了扱い
-  const looksLikeList =
-    (await page.getByText(/検索結果|件中/).count()) > 0 ||
-    (await page.locator("a:has-text('詳細ページへ')").count()) > 0;
-
-  if (looksLikeList) {
-    console.log("[info] 既に物件一覧に到達");
-    return "list";
+  // 最後の手：ページ内のリンク文字から条件検索っぽいものを拾う
+  const anchors = await page.locator('a').allTextContents().catch(() => []);
+  const hit = anchors.find(t => /条件.*(検索|探す)|先着順あき家|詳細検索/.test(t));
+  if (hit) {
+    await clickByTextRobust(page, hit);
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+    await closeOverlays(page);
+    await save(page, 'conditions_or_list');
+    return true;
   }
 
-  // 条件フォームの「検索」ボタンを押して一覧へ
-  // ボタン表記のゆれを吸収
-  const searchButtons = [
-    'input[type="submit"][value="検 索"]',
-    'input[type="submit"][value="検索"]',
-    'button:has-text("検索")',
-    'input[type="image"]',
-  ];
-  for (const s of searchButtons) {
-    const ok = await safeClick(page, s, { timeout: 2500 });
-    if (ok) break;
+  throw new Error('こだわり条件のリンクが見つかりませんでした');
+}
+
+/** 条件画面で “そのまま検索”（こだわらない）→ 物件一覧へ */
+async function submitSimpleSearch(page) {
+  // 画面全文から「検索」ボタンっぽい要素を探す
+  const tried =
+    (await clickByTextRobust(page, '検索')) ||
+    (await clickByTextRobust(page, 'この条件で探す')) ||
+    (await clickByTextRobust(page, '表示')) ||
+    (await clickByTextRobust(page, '検索する'));
+
+  if (!tried) {
+    // ボタンが見つからなければフォーム submit を強行
+    await page.evaluate(() => {
+      const f = document.querySelector('form');
+      if (f) f.submit();
+    }).catch(() => {});
   }
 
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await closeObstacles(page);
-  await shot(page, "result_list");
-  await saveHtml(page, "result_list");
-  return "list";
+  // 一覧の到着確認（「件」「一覧」「結果」など）
+  await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+  await closeOverlays(page);
+
+  const arrived = await Promise.race([
+    page.waitForSelector('text=件',     { timeout: 8000 }).then(() => true).catch(() => false),
+    page.waitForSelector('text=一覧',   { timeout: 8000 }).then(() => true).catch(() => false),
+    page.waitForSelector('text=結果',   { timeout: 8000 }).then(() => true).catch(() => false),
+    page.waitForSelector('img',         { timeout: 8000 }).then(() => true).catch(() => false),
+  ]);
+
+  await save(page, arrived ? 'result_list' : 'last_page_fallback');
+  if (!arrived) throw new Error('物件一覧に到達できませんでした');
 }
 
 async function main() {
-  await fs.mkdir(OUT, { recursive: true });
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 1600 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-  });
+  console.log('[step] goto landing (prefer to-kousya)');
+  const browser = await chromium.launch({ headless: true, slowMo: SLOWMO });
+  const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
   const page = await context.newPage();
 
   try {
-    await gotoChintaiTop(page);
-    const status = await openConditions(page);
-    console.log(`[done] status: ${status}`);
+    await gotoLanding(page);
+
+    console.log('[step] open conditions (こだわり条件)');
+    await openConditions(page);
+
+    console.log('[step] submit simple search (こだわらないで検索)');
+    await submitSimpleSearch(page);
+
+    console.log('[done] reached result list');
   } catch (e) {
-    console.error("[fatal]", e);
+    console.error('[fatal]', e);
+    // 最後の状態も保存
+    try { await save(page, 'last_page_fallback'); } catch {}
+    process.exitCode = 1;
   } finally {
+    await context.close();
     await browser.close();
   }
 }
