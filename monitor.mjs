@@ -1,178 +1,171 @@
 // monitor.mjs
-// Playwright + Node.js ESM
+// Playwright で JKK東京の物件一覧に到達する決め打ちルート版
+// 生成物: artifacts/landing.*, chintai_top.*, conditions_or_list.*(あれば), result_list.*(一覧)
+
 import { chromium } from 'playwright';
-import fs from 'node:fs/promises';
+import fs from 'fs/promises';
 
-const ART_DIR = 'artifacts';
-const BASE = 'https://www.to-kousya.or.jp';
+const ARTIFACTS_DIR = 'artifacts';
+const SITE_ROOT = 'https://www.to-kousya.or.jp/';
 
-async function save(page, name) {
-  await fs.mkdir(ART_DIR, { recursive: true });
-  const html = await page.content();
-  await fs.writeFile(`${ART_DIR}/${name}.html`, html, 'utf8');
-  await page.screenshot({ path: `${ART_DIR}/${name}.png`, fullPage: true });
-  console.log(`[saved] ${name}`);
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true }).catch(() => {});
+}
+async function save(page, base) {
+  await ensureDir(ARTIFACTS_DIR);
+  await fs.writeFile(`${ARTIFACTS_DIR}/${base}.html`, await page.content());
+  await page.screenshot({ path: `${ARTIFACTS_DIR}/${base}.png`, fullPage: true });
+  console.log(`[artifacts] saved: ${base}.html / ${base}.png`);
+}
+async function gotoWithRetries(page, url, tries = 3) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      console.log(`[goto] (${i}/${tries}) ${url}`);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+      return;
+    } catch (e) {
+      console.log(`[goto-retry] ${url} -> ${e.message}`);
+      await page.waitForTimeout(i * 800);
+    }
+  }
+  throw new Error(`page.goto failed: ${url}`);
 }
 
-function log(step) {
-  console.log(`[step] ${step}`);
+async function closeOverlays(page) {
+  // cookie同意バーやチャットの閉じるを可能な限り潰す
+  const candidates = [
+    'button:has-text("閉じる")',
+    'button:has-text("同意")',
+    'button:has-text("OK")',
+    'text=閉じる',             // チャットの閉じる
+    'role=button[name="閉じる"]'
+  ];
+  for (const sel of candidates) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.count()) {
+        await el.click({ timeout: 1500 });
+        await page.waitForTimeout(300);
+      }
+    } catch {}
+  }
+  // 画面下部のクッキーバナー（テキストが長い場合の保険）
+  try {
+    const cookieBar = page.locator('text=/クッキー.*使用しています/').first();
+    if (await cookieBar.count()) {
+      const closeBtn = cookieBar.locator('text=閉じる').first();
+      if (await closeBtn.count()) await closeBtn.click({ timeout: 1500 });
+    }
+  } catch {}
 }
 
-async function maybeClick(page, locatorOrSelector, opt = {}) {
-  const loc = typeof locatorOrSelector === 'string'
-    ? page.locator(locatorOrSelector)
-    : locatorOrSelector;
-  const count = await loc.count().catch(() => 0);
-  if (count > 0) {
-    await loc.first().scrollIntoViewIfNeeded().catch(()=>{});
-    await loc.first().click({ timeout: 5000, ...opt }).catch(()=>{});
+async function clickHeroConditions(page) {
+  // ヒーローの「お部屋をえらぶ」枠の中だけで「こだわり条件」を探す（サイト内検索の誤クリックを回避）
+  const hero = page.locator('section:has-text("お部屋をえらぶ")').first();
+  if (!(await hero.count())) return false;
+
+  const link = hero.locator('a:has-text("こだわり条件")').first();
+  if (await link.count()) {
+    console.log('[step] click hero "こだわり条件"');
+    await link.click({ timeout: 4000 });
+    await page.waitForLoadState('domcontentloaded');
+    await closeOverlays(page);
+    await save(page, 'conditions_or_list');
     return true;
   }
   return false;
 }
 
-async function clickOneOf(page, selectors, opt = {}) {
-  for (const s of selectors) {
-    if (await maybeClick(page, s, opt)) return true;
-  }
-  return false;
-}
-
-async function closeOverlays(page) {
-  // Cookie バナー
-  await clickOneOf(page, [
-    'button:has-text("同意")',
-    'button:has-text("閉じる")',
-    'button[aria-label="閉じる"]',
-    'text=/クッキー.*使用しています/ >> xpath=..//button',
-  ]);
-  // チャット等
-  await clickOneOf(page, [
-    'button:has-text("×")',
-    'button[aria-label="Close"]',
-  ]);
-}
-
 async function gotoChintaiTop(page) {
-  log('goto landing');
-  await page.goto(BASE, { waitUntil: 'domcontentloaded' });
-  await closeOverlays(page);
-  await save(page, 'landing');
-
-  // ヘッダの「賃貸住宅情報」へ（複数パターンを許容）
-  log('open chintai top');
-  const ok = await clickOneOf(page, [
-    'a[href*="/chintai/index.html"]',
-    'a:has-text("賃貸住宅情報")',
-  ]);
-  if (!ok) throw new Error('賃貸住宅情報リンクが見つかりませんでした');
-
-  await page.waitForLoadState('domcontentloaded');
+  console.log('[step] goto 賃貸トップ (chintai/index.html)');
+  await gotoWithRetries(page, new URL('/chintai/index.html', SITE_ROOT).toString());
   await closeOverlays(page);
   await save(page, 'chintai_top');
 }
 
-async function openKodawariOrConditions(page) {
-  log('click こだわり条件（新UIボタン）');
-  // 新サイトの「こだわり条件」ボタンをできるだけ広く拾う
-  await clickOneOf(page, [
-    'a:has-text("こだわり条件")',
-    'button:has-text("こだわり条件")',
-    // ARIA ロール
-    page.getByRole('link', { name: 'こだわり条件' }),
-    page.getByRole('button', { name: 'こだわり条件' }),
-  ]);
-
-  // ここから 3 分岐を吸収：
-  // (A) 旧サイトの「しばらくしても…こちら」待機ページ
-  // (B) 旧サイトの「エリアで検索（地図）」ページ
-  // (C) 旧サイトの「条件から検索（チェックボックスのフォーム）」ページ
-  await page.waitForLoadState('domcontentloaded');
-
-  // A: 待機ページの「こちら」
-  if (await page.locator('a:has-text("こちら")').first().isVisible().catch(()=>false)) {
-    log('legacy relay page detected → click こちら');
-    await page.locator('a:has-text("こちら")').first().click({ timeout: 5000 });
-    await page.waitForLoadState('domcontentloaded');
+async function clickJkkListFromChintai(page) {
+  // 「JKK東京ならではの物件」ブロックの「住宅一覧」を狙う
+  const section = page.locator('section:has-text("JKK東京ならではの物件")').first();
+  let link = section.locator('a:has-text("住宅一覧")').first();
+  if (!(await link.count())) {
+    // セクション構造が変わっていた場合の保険
+    link = page.locator('a:has-text("住宅一覧")').first();
   }
-
-  // B: 地図ページ（「条件から検索」リンクが右上にある）
-  if (await page.locator('a:has-text("条件から検索")').first().isVisible().catch(()=>false)) {
-    log('map page detected → click 条件から検索');
-    await page.locator('a:has-text("条件から検索")').first().click({ timeout: 5000 });
+  if (await link.count()) {
+    console.log('[step] click "住宅一覧"');
+    await link.click({ timeout: 4000 });
     await page.waitForLoadState('domcontentloaded');
+    await closeOverlays(page);
+    return true;
   }
-
-  // C: 条件フォーム or 直接一覧
-  await closeOverlays(page);
-  await save(page, 'conditions_or_list');
+  return false;
 }
 
-async function runSearchOrDetectList(page) {
-  // すでに一覧ならそのまま保存
-  const looksLikeList = async () => {
-    const markers = [
-      'a:has-text("詳細ページへ")',
-      'text=物件一覧',
-      'text=該当件数',
-    ];
-    for (const m of markers) {
-      if ((await page.locator(m).count().catch(()=>0)) > 0) return true;
-    }
-    return false;
-  };
-
-  if (await looksLikeList()) {
-    log('already on list page');
-    await save(page, 'result_list');
-    return;
+async function verifyAsList(page) {
+  // 一覧っぽさの判定: 「住宅一覧絞り込む」や「物件詳細」等があればOK
+  const markers = [
+    'text=住宅一覧絞り込む',
+    'text=物件詳細',
+    'text=件中',
+    'role=button[name=/物件詳細|問合せへ/]',
+  ];
+  for (const m of markers) {
+    if (await page.locator(m).first().count()) return true;
   }
-
-  // 条件ページの「検索」ボタン（複数パターン）
-  log('try click 検索 on conditions');
-  const clicked = await clickOneOf(page, [
-    'input[type="submit"][value="検索"]',
-    'input[type="button"][value="検索"]',
-    'button:has-text("検索")',
-  ]);
-  if (!clicked) {
-    throw new Error('検索ボタンが見つかりませんでした（条件ページ検出失敗の可能性）');
-  }
-
-  await page.waitForLoadState('domcontentloaded');
-  await closeOverlays(page);
-
-  // 旧サイトは検索後にまた中継ページへ飛ぶことがある
-  if (await page.locator('a:has-text("こちら")').first().isVisible().catch(()=>false)) {
-    log('post-search relay page → click こちら');
-    await page.locator('a:has-text("こちら")').first().click({ timeout: 5000 });
-    await page.waitForLoadState('domcontentloaded');
-  }
-
-  await closeOverlays(page);
-  await save(page, 'result_list');
+  // 404 ページ（「ページが見つかりません」）なら NG
+  if (await page.locator('text=ページが見つかりません').first().count()) return false;
+  // サイト内検索(result.html)に飛んでしまった場合も NG
+  if (page.url().includes('/result.html')) return false;
+  return false;
 }
 
 async function main() {
+  await ensureDir(ARTIFACTS_DIR);
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     viewport: { width: 1280, height: 1600 },
     userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari',
   });
   const page = await context.newPage();
 
   try {
-    await gotoChintaiTop(page);
-    await openKodawariOrConditions(page);
-    await runSearchOrDetectList(page);
-    console.log('[done] reached list');
+    console.log('[step] goto landing');
+    await gotoWithRetries(page, SITE_ROOT);
+    await closeOverlays(page);
+    await save(page, 'landing');
+
+    // 1) まずヒーローの「こだわり条件」を試す
+    const clickedHero = await clickHeroConditions(page);
+
+    // 2) それで一覧に行けない/行けなさそうなら、賃貸トップへ → 「住宅一覧」
+    if (!clickedHero) {
+      await gotoChintaiTop(page);
+    } else {
+      // もし「条件から検索」画面などに出たら、そのままでは一覧にならないので賃貸トップに切り替える
+      const looksLikeList = await verifyAsList(page);
+      if (!looksLikeList) {
+        await gotoChintaiTop(page);
+      }
+    }
+
+    // 賃貸トップから「住宅一覧」を踏む
+    const ok = await clickJkkListFromChintai(page);
+    if (!ok) throw new Error('「住宅一覧」リンクが見つかりませんでした');
+
+    // 一覧確認 & 保存
+    const isList = await verifyAsList(page);
+    if (!isList) throw new Error('物件一覧に到達できませんでした');
+
+    await save(page, 'result_list');
+    console.log('[done] reached result_list');
   } catch (e) {
     console.error('[fatal]', e);
-    // 何が起きたか分かるように最後のページをダンプ
-    try { await save(page, 'error_fallback'); } catch {}
+    // 最後のページだけでも退避
+    await save(page, 'last_page_fallback');
     process.exitCode = 1;
   } finally {
+    await context.close();
     await browser.close();
   }
 }
