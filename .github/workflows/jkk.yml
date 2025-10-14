@@ -3,8 +3,7 @@ name: jkk-watch
 on:
   workflow_dispatch:
   schedule:
-    # 例: 平日 9:00 と 15:00 に実行（任意で調整OK）
-    - cron: '0 0,6 * * 1-5'
+    - cron: "*/30 22-14 * * *" # JST 7:00-23:59 相当で30分おき（必要に応じて調整）
 
 jobs:
   run:
@@ -18,15 +17,14 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      - name: Install npm deps
+      - name: Install npm deps (with lockfile)
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm i
+          if [ ! -f package-lock.json ]; then
+            echo "Lockfile missing. Run 'npm install' locally once and commit package-lock.json."; exit 1;
           fi
+          npm ci
 
       - name: Install Playwright (browsers + system deps)
         run: npx playwright install --with-deps
@@ -40,6 +38,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jkk-artifacts
+          name: artifacts
           path: artifacts
-          if-no-files-found: warn
+          if-no-files-found: ignore
+          retention-days: 7
