@@ -3,14 +3,20 @@ name: jkk-watch
 on:
   workflow_dispatch:
   schedule:
-    # JST 07:00–23:59 を2回/時（00分,30分）で回す
-    # UTCに直すと 22–23時, 00–14時（0,30分）
-    - cron: '0,30 22-23,0-14 * * *'
+    # GitHub cronはUTC。22-23時と0-14時を「2行」に分けて30分間隔で実行
+    - cron: "*/30 22-23 * * *"
+    - cron: "*/30 0-14 * * *"
+
+concurrency:
+  group: jkk-watch
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Tokyo
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,12 +24,13 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
+
+      - name: Install npm deps (CI)
+        run: npm ci
 
       - name: Install Playwright (browsers + system deps)
-        run: |
-          npm ci || npm i
-          npx playwright install --with-deps
+        run: npx playwright install --with-deps chromium
 
       - name: Run script
         run: |
@@ -34,6 +41,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: artifacts
+          name: jkk-artifacts
           path: artifacts
+          if-no-files-found: ignore
           retention-days: 7
