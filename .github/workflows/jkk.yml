@@ -3,7 +3,8 @@ name: jkk-watch
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 * * * *"   # 毎時10分に実行（必要に応じて変更OK）
+    # 例: 平日 9:00 と 15:00 に実行（任意で調整OK）
+    - cron: '0 0,6 * * 1-5'
 
 jobs:
   run:
@@ -18,24 +19,27 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install npm deps
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm i
+          fi
 
       - name: Install Playwright (browsers + system deps)
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps
 
       - name: Run script
         run: |
           mkdir -p artifacts
           node monitor.mjs
 
-      - name: Upload artifacts (always)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jkk-artifacts
           path: artifacts
-          if-no-files-found: ignore
-          retention-days: 7
+          if-no-files-found: warn
