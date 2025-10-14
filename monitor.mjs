@@ -1,228 +1,167 @@
-// monitor.mjs
-import fs from "fs/promises";
-import { chromium } from "playwright";
+// monitor.mjs ーーー 丸ごと置き換えOK
+import fs from 'fs/promises';
+import path from 'path';
+import { chromium } from 'playwright';
 
-const OUT = (name) => ({
-  html: `artifacts/${name}.html`,
-  png:  `artifacts/${name}.png`,
-});
+const ART_DIR = 'artifacts';
+const SEARCH_KANA = process.env.SEARCH_KANA || 'コーシャハイム';
 
-/** HTML+スクショを保存（失敗しても落ちない） */
-async function save(page, name) {
+// ------------- ユーティリティ -------------
+async function save(page, base) {
   try {
-    const html = await page.content(); // ← Promiseをawait（以前のERR_INVALID_ARG_TYPE対策）
-    await fs.writeFile(OUT(name).html, html);
+    await fs.mkdir(ART_DIR, { recursive: true });
+    const html = await page.content();                 // ← await を忘れると以前のエラーになります
+    await fs.writeFile(path.join(ART_DIR, `${base}.html`), html);
+    await page.screenshot({ path: path.join(ART_DIR, `${base}.png`), fullPage: true });
+    console.log(`[artifacts] saved: ${base}.html / ${base}.png`);
   } catch (e) {
-    console.warn(`[warn] save html(${name})`, e?.message);
-  }
-  try {
-    await page.screenshot({ path: OUT(name).png, fullPage: true });
-  } catch (e) {
-    console.warn(`[warn] save png(${name})`, e?.message);
+    console.warn('[artifacts] save failed:', e.message);
   }
 }
 
-/** 軽い待ち */
-const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/** ランディングへ（to-kousya 優先） */
-async function gotoLanding(ctx) {
-  console.log("[step] goto landing (prefer to-kousya)");
-  const page = await ctx.newPage();
-
-  // 1st: to-kousya
-  await page.goto("https://www.to-kousya.or.jp/chintai/index.html", {
-    waitUntil: "domcontentloaded",
-  }).catch(() => {});
-
-  // 万一失敗時のリトライ（DNSや一時エラー対策）
-  if (!/to-kousya\.or\.jp/.test(page.url())) {
-    const candidates = [
-      "https://www.to-kousya.or.jp/jkk/",
-      "https://www.to-kousya.or.jp/",
-    ];
-    for (const url of candidates) {
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded" });
-        if (page.url().startsWith("https://www.to-kousya.or.jp")) break;
-      } catch {}
-    }
-  }
-
-  // Cookie等のバナーを適当に閉じる（あれば）
-  try {
-    const close = page.getByRole("button", { name: /閉じる|OK|同意/i });
-    await close.first().click({ timeout: 1500 });
-  } catch {}
-  await save(page, "landing");
-  return page;
-}
-
-/** 「こだわり条件」を開く → ポップアップ（or 同タブ遷移）をハンドリング */
-async function clickConditions(page, ctx) {
-  console.log("[step] open conditions (こだわり条件)");
-
-  // 候補セレクタ（順に試す）
+// ------------- ステップ: ランディングへ -------------
+async function gotoLanding(page) {
+  console.log('[step] goto landing (prefer to-kousya)');
   const candidates = [
-    page.getByRole("link", { name: /こだわり条件/ }),
-    page.locator('a:has-text("こだわり条件")'),
-    page.locator('button:has-text("こだわり条件")'),
-    page.locator('a[href*="jkknet"]'),
+    'https://www.to-kousya.or.jp/jkk/',
+    // フォールバック（将来ドメインが戻った場合）
+    'https://www.jkk-portal.jp/',
+    'http://www.jkk-portal.jp/'
   ];
 
-  let clicked = false;
-  for (const loc of candidates) {
-    try {
-      if ((await loc.count()) > 0) {
-        await loc.first().scrollIntoViewIfNeeded();
-        const popupWait = ctx.waitForEvent("page", { timeout: 8000 }).catch(() => null);
-        await loc.first().click({ timeout: 3000 });
-        // 新規ページ（ポップアップ）を優先取得
-        const pop = await popupWait;
-        if (pop) return pop;
-        clicked = true;
-        break; // 同タブ遷移っぽい
-      }
-    } catch {}
-  }
-  if (!clicked) throw new Error("こだわり条件のリンクが見つかりませんでした");
-
-  // 同タブで「待機ページ」に行くケース
-  await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
-  return page;
-}
-
-/** 「待機ページ」→ 自動遷移 or 「こちら」クリック → JKKnet条件ページ */
-async function followWaitingAndGetJkkPage(ctx) {
-  // 直近で開いているページ達を確認
-  let target = ctx.pages().slice(-1)[0];
-
-  // 「こちら」リンクがある場合はクリック（自動window.openが効かない環境対策）
-  try {
-    if (/\/search\/jkknet\/wait\.jsp/.test(target.url())) {
-      await save(target, "entry_referer"); // 参考用
-      const here = target.getByRole("link", { name: "こちら" });
-      if ((await here.count()) > 0) {
-        const popupWait = ctx.waitForEvent("page", { timeout: 8000 }).catch(() => null);
-        await here.first().click();
-        const pop = await popupWait;
-        if (pop) target = pop;
-      }
-    }
-  } catch {}
-
-  // 条件トップ（先着順あき家検索）が開くまで待機（別ウィンドウ or 同タブ）
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    const pages = ctx.pages();
-    const hit = pages.find((p) =>
-      /akiyaJyoukenStartInit|akiyaJyouken/.test(p.url())
-    );
-    if (hit) {
-      await hit.bringToFront().catch(() => {});
-      await hit.waitForLoadState("domcontentloaded").catch(() => {});
-      await save(hit, "popup_top");
-      return hit;
-    }
-    await nap(300);
-  }
-  // どれにも当たらなければ最後のページを返す（フォールバック）
-  const fallback = ctx.pages().slice(-1)[0];
-  await save(fallback, "last_page_fallback");
-  return fallback;
-}
-
-/** 「住宅名（カナ）」に入力 → 検索 */
-async function fillAndSearch(jkkPage) {
-  console.log("[step] fill conditions");
-
-  // 入力欄の探索（表組みでも拾えるように多段フォールバック）
-  async function findKanaInput(p) {
-    const tryLocs = [
-      p.getByLabel(/住宅名.*カナ/),
-      p.locator('input[placeholder*="カナ"]'),
-      p.locator('input[name*="Kana" i]'),
-      // 「住宅名（カナ）」のセルの次の input を拾う
-      p.locator('xpath=//td[contains(normalize-space(),"住宅名") and contains(.,"カナ")]/following::input[1]'),
-    ];
-    for (const loc of tryLocs) {
+  for (const url of candidates) {
+    for (let i = 0; i < 3; i++) {
       try {
-        if ((await loc.count()) > 0) return loc.first();
-      } catch {}
-    }
-    // frame 内も探索
-    for (const f of p.frames()) {
-      for (const loc of [
-        f.getByLabel(/住宅名.*カナ/),
-        f.locator('input[placeholder*="カナ"]'),
-        f.locator('input[name*="Kana" i]'),
-        f.locator('xpath=//td[contains(normalize-space(),"住宅名") and contains(.,"カナ")]/following::input[1]'),
-      ]) {
-        try {
-          if ((await loc.count()) > 0) return loc.first();
-        } catch {}
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await save(page, 'landing');
+        return;
+      } catch (e) {
+        console.log(`[goto-retry] ${url} -> ${e.message} (sleep ${800 * (i + 1)}ms)`);
+        await sleep(800 * (i + 1));
       }
     }
-    return null;
   }
-
-  const kana = await findKanaInput(jkkPage);
-  if (kana) {
-    await kana.fill("コーシャハイム", { timeout: 4000 }).catch(() => {});
-  } else {
-    console.warn("[warn] 住宅名（カナ）欄が見つかりませんでした（入力スキップ）");
-  }
-
-  // 検索ボタン
-  async function findSearchButton(p) {
-    const locs = [
-      p.getByRole("button", { name: /検索する|検索/ }),
-      p.locator('input[type="submit"][value*="検索"]'),
-      p.locator('button:has-text("検索")'),
-    ];
-    for (const loc of locs) {
-      if ((await loc.count()) > 0) return loc.first();
-    }
-    for (const f of p.frames()) {
-      for (const loc of [
-        f.getByRole("button", { name: /検索する|検索/ }),
-        f.locator('input[type="submit"][value*="検索"]'),
-        f.locator('button:has-text("検索")'),
-      ]) {
-        if ((await loc.count()) > 0) return loc.first();
-      }
-    }
-    return null;
-  }
-
-  const searchBtn = await findSearchButton(jkkPage);
-  if (searchBtn) {
-    await searchBtn.scrollIntoViewIfNeeded().catch(() => {});
-    await searchBtn.click({ timeout: 4000 }).catch(() => {});
-  } else {
-    console.warn("[warn] 検索ボタンが見つかりません（このまま保存へ）");
-  }
-
-  // 検索結果（物件一覧）を保存（同タブ遷移/フレーム遷移どちらでも）
-  try {
-    await jkkPage.waitForLoadState("domcontentloaded", { timeout: 8000 });
-  } catch {}
-  await save(jkkPage, "result_list");
+  throw new Error('landing に到達できませんでした');
 }
 
+// ------------- ステップ: こだわり条件を開く（ポップアップ/待機ページ両対応） -------------
+async function openConditions(page) {
+  console.log('[step] open conditions');
+
+  // バナー類があれば閉じる（失敗しても無視）
+  await page.locator('text=閉じる').first().click({ timeout: 1500 }).catch(() => {});
+  await page.keyboard.press('Escape').catch(() => {});
+
+  // 「こだわり条件」ボタン候補
+  const condBtn = page.locator([
+    'a:has-text("こだわり条件")',
+    'button:has-text("こだわり条件")',
+    '[aria-label*="こだわり条件"]',
+  ].join(',')).first();
+
+  await condBtn.scrollIntoViewIfNeeded().catch(() => {});
+  await condBtn.waitFor({ state: 'visible', timeout: 8000 });
+
+  // クリックと popup を同時に待つ（出ないサイト配置もあるので両対応）
+  const p = page.waitForEvent('popup').catch(() => null);
+  await condBtn.click({ delay: 30 });
+  let work = await p;
+  if (!work) work = page;          // 同一タブ遷移パターン
+
+  await work.waitForLoadState('domcontentloaded');
+
+  // 「待機ページ」（wait.jsp / 「数秒後に自動で次の画面」/「こちら」）に対処
+  const isWait =
+    /wait\.jsp/i.test(work.url()) ||
+    (await work.locator('text=数秒後に自動で次の画面').count()) > 0 ||
+    (await work.locator('a:has-text("こちら")').count()) > 0;
+
+  if (isWait) {
+    // onload 相当の openMainWindow() を明示実行（あれば）
+    await work.evaluate(() => { try { window.openMainWindow?.(); } catch (_) {} }).catch(() => {});
+    // forwardForm がなければ「こちら」をクリック
+    await work.locator('a:has-text("こちら")').first().click({ timeout: 2000 }).catch(() => {});
+    // どちらでも次画面のロードを待つ
+    await work.waitForLoadState('load').catch(() => {});
+  }
+
+  // ポップアップ側が JKKnet ウィンドウ名で開く場合に備えて前面へ
+  try { if (work && (await work.evaluate(() => window.name)) === 'JKKnet') await work.bringToFront(); } catch {}
+  return work;
+}
+
+// ------------- ステップ: 条件入力 & 検索 -------------
+async function fillAndSearch(jkkPage) {
+  console.log('[step] fill conditions & search');
+
+  // できれば「住宅名（カナ）」に入力（取れない場合はスキップして検索）
+  let filled = false;
+  const kanaLocators = [
+    // 「住宅名（カナ）」という表示に隣接する input
+    'xpath=//*[contains(normalize-space(.),"住宅名") and contains(normalize-space(.),"カナ")]/ancestor::*[self::tr or self::td or self::th][1]//input[1]',
+    'xpath=//label[contains(normalize-space(.),"住宅名") and contains(normalize-space(.),"カナ")]/following::*[self::input or self::textarea][1]',
+    // aria/タイトル系
+    'input[title*="カナ"]',
+    'input[aria-label*="カナ"]',
+    // 最後の保険：フォーム内のテキストボックスを総当りして placeholder にカナを含むもの
+    'xpath=//input[@type="text" and contains(@placeholder,"カナ")]'
+  ];
+
+  for (const sel of kanaLocators) {
+    const loc = jkkPage.locator(sel).first();
+    try {
+      if (await loc.count()) {
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.fill(''); await loc.type(SEARCH_KANA, { delay: 30 });
+        filled = true;
+        break;
+      }
+    } catch { /* 次の候補へ */ }
+  }
+  console.log(filled ? `[info] 住宅名（カナ）に入力: ${SEARCH_KANA}` : '[warn] 住宅名（カナ）が見つからず、入力をスキップ');
+
+  // 「検索する」押下（input/button/画像ボタン いずれでも）
+  const searchBtn = jkkPage.locator([
+    'button:has-text("検索する")',
+    'input[type="submit"][value="検索する"]',
+    'input[alt="検索する"]',
+    'input[type="image"][alt*="検索"]',
+    'input[type="submit"]'
+  ].join(',')).first();
+
+  await searchBtn.waitFor({ state: 'visible', timeout: 15000 });
+  await Promise.all([
+    jkkPage.waitForLoadState('domcontentloaded'),
+    searchBtn.click({ delay: 30 })
+  ]);
+
+  // 結果らしきテーブル/「詳細」ボタン等が出るのを待機（緩め）
+  await jkkPage.waitForTimeout(1200);
+}
+
+// ------------- メイン -------------
 async function main() {
   const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  const context = await browser.newContext({ viewport: { width: 1240, height: 2200 } });
+  const page = await context.newPage();
 
   try {
-    const landing = await gotoLanding(ctx);
-    const maybePopup = await clickConditions(landing, ctx);
-    const jkk = await followWaitingAndGetJkkPage(ctx);
-    await fillAndSearch(jkk);
+    await gotoLanding(page);
+
+    const jkkPage = await openConditions(page);
+    await save(jkkPage, 'popup_top');       // 条件トップ（JKKnet側）を保存
+
+    await fillAndSearch(jkkPage);
+    await save(jkkPage, 'result_list');     // 一覧を保存
   } catch (e) {
-    console.error("[fatal]", e);
+    console.error('[fatal]', e);
+    try { await save(page, 'last_page_fallback'); } catch {}
+    process.exitCode = 1;
   } finally {
-    await browser.close();
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 }
 
