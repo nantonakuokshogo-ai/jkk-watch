@@ -1,262 +1,201 @@
-// monitor.mjs
-// 目的:
-// 1) JKK TOP を開く（to-kousya 優先、ダメなら jkk-portal/jkk）
-// 2) 「こだわり条件」を開く（同タブ/ポップアップ両対応）
-// 3) 住宅名（カナ）に「コーシャハイム」を入力 → 検索 → 一覧保存
-// 4) 各段階で HTML/PNG を artifacts/ に保存（失敗時は last_page_fallback も保存）
-
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
-import path from 'node:path';
 
-// =============== 共通ユーティリティ ===============
-const ART_DIR = path.resolve('artifacts');
+const ART = (name) => `artifacts/${name}`;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function ensureArtDir() {
-  await fs.mkdir(ART_DIR, { recursive: true });
-}
-
-function logStep(msg) {
-  console.log(`[step] ${msg}`);
-}
-function logInfo(msg) {
-  console.log(`[info] ${msg}`);
-}
-function logFatal(err) {
-  console.error('[fatal]', err);
-}
-
-async function savePage(page, base) {
-  const htmlPath = path.join(ART_DIR, `${base}.html`);
-  const pngPath  = path.join(ART_DIR, `${base}.png`);
-
-  const html = await page.content();
-  await fs.writeFile(htmlPath, html);
-  await page.screenshot({ path: pngPath, fullPage: true });
-  logInfo(`[artifacts] saved: ${base}.html / ${base}.png`);
-}
-
-async function saveLastFallback(page) {
+async function save(page, base) {
   try {
-    await savePage(page, 'last_page_fallback');
-  } catch {
-    // 失敗時でもとりあえず HTML だけ試す
+    const html = await page.content();
+    await fs.writeFile(ART(`${base}.html`), html);
+  } catch {}
+  try {
+    await page.screenshot({ path: ART(`${base}.png`), fullPage: true });
+  } catch {}
+}
+
+async function clickIfVisible(page, locator) {
+  const el = page.locator(locator).first();
+  if (await el.count()) {
     try {
-      const htmlPath = path.join(ART_DIR, `last_page_fallback.html`);
-      await fs.writeFile(htmlPath, await page.content());
-      logInfo(`[artifacts] saved: last_page_fallback.html`);
-    } catch { /* no-op */ }
+      await el.scrollIntoViewIfNeeded();
+      await el.waitFor({ state: 'visible', timeout: 1500 });
+      await el.click({ timeout: 1500 });
+      return true;
+    } catch {}
   }
+  return false;
 }
 
-// 「数秒後に自動で… こちら」タイプの自動遷移を踏む
-async function followAutoForward(page) {
-  const a = page.locator('a:has-text("こちら")');
-  if (await a.count()) {
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded').catch(() => {}),
-      a.first().click().catch(() => {})
-    ]);
+async function closeCookieBanner(page) {
+  // 公式サイトの“閉じる”バナー対策（404含む）
+  // 例: <a class="cc-btn cc-dismiss">閉じる</a>
+  const candidates = [
+    'button:has-text("閉じる")',
+    'a:has-text("閉じる")',
+    '.cc-btn.cc-dismiss',
+  ];
+  for (const sel of candidates) {
+    if (await clickIfVisible(page, sel)) return true;
   }
+  return false;
 }
 
-// =============== 1. TOP へ移動（複数URL/リトライ） ===============
-const LANDING_CANDIDATES = [
-  // 公式の「JKK東京（住宅者向け）」TOP配下
-  'https://www.to-kousya.or.jp/jkk/',
-  // 過去の URL（保険）
-  'https://www.jkk-portal.jp/',
-  'https://jkk-portal.jp/',
-];
-
-async function gotoWithRetries(page, urls, eachTries = 3) {
-  for (const u of urls) {
-    for (let i = 1; i <= eachTries; i++) {
+async function gotoWithRetries(page, urls) {
+  for (const { url, tag } of urls) {
+    for (const attempt of [1,2,3]) {
       try {
-        logInfo(`[goto] (${i}/${eachTries}) ${u}`);
-        await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await followAutoForward(page);
+        console.log(`[goto] (${attempt}/3) ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await save(page, tag === 'landing' ? 'landing' : `landing_${tag}`);
+        // 404 判定（見出し“ページが見つかりません”）
+        if (await page.getByText('ページが見つかりません').first().count()) {
+          await closeCookieBanner(page);
+          await save(page, 'last_page_fallback');
+          // 404 なら次URLへ
+          break;
+        }
         return true;
       } catch (e) {
-        logInfo(`[goto-retry] ${u} -> ${e.message || e}`);
-        const sleep = 600 * i;
-        await new Promise(r => setTimeout(r, sleep));
+        if (attempt === 3) break;
+        await sleep(800 * attempt);
       }
     }
   }
   return false;
 }
 
-async function gotoLanding(page) {
-  logStep('goto landing (prefer to-kousya)');
-  const ok = await gotoWithRetries(page, LANDING_CANDIDATES, 3);
-  if (!ok) throw new Error('TOPへ到達できませんでした');
-  await savePage(page, 'landing');
-}
-
-// =============== 2. こだわり条件 を開く（同タブ/ポップアップ両対応） ===============
 async function clickConditions(page) {
-  logStep('open conditions (こだわり条件)');
+  console.log('[step] open conditions (こだわり条件)');
+  // まずはクッキー閉じる
+  await closeCookieBanner(page);
 
-  // Cookie等の閉じる（あれば）
-  await page
-    .locator('button:has-text("閉じる"), button:has-text("同意"), button:has-text("同意する")')
-    .first()
-    .click({ timeout: 2000 })
-    .catch(() => {});
-
-  // 候補セレクタ
   const candidates = [
-    // TOP 中央の大きいボタンが button>span のこともある
-    'button:has-text("こだわり")',
-    'button:has-text("条件")',
-    // a リンクのこともある
-    'a:has-text("こだわり")',
-    'a:has-text("条件")',
-    // フォールバック: href に search/akiya/などが入ることがある
-    'a[href*="search"]',
-    'a[href*="akiya"]',
+    // aタグ / ボタンのどちらにも対応
+    'a:has-text("こだわり条件")',
+    'button:has-text("こだわり条件")',
+    // 画面内のカード風ボタン対策
+    '[href*="koda"]',
+    'text=こだわり条件'
   ];
 
-  let target = null;
   for (const sel of candidates) {
-    const l = page.locator(sel).first();
-    if (await l.count().catch(() => 0)) {
-      target = l;
-      break;
-    }
-  }
+    const has = await page.locator(sel).first().count();
+    if (!has) continue;
 
-  // 最終フォールバック: DOM走査で「こだわり」を含む a/button をクリック
-  if (!target) {
-    await page.evaluate(() => {
-      const el = [...document.querySelectorAll('a,button')].find(
-        x => /こだわり|条件/.test((x.textContent || '').trim())
-      );
-      el?.click();
-    });
-  } else {
-    const [popup] = await Promise.all([
-      page.waitForEvent('popup', { timeout: 15000 }).catch(() => null),
-      target.click().catch(() => null)
-    ]);
+    // 新しいウィンドウが開く想定で待つ。ただし開かない場合もあるので両方許容。
+    const popupPromise = page.waitForEvent('popup', { timeout: 4000 }).catch(() => null);
+    try {
+      await page.locator(sel).first().scrollIntoViewIfNeeded();
+      await page.locator(sel).first().click({ timeout: 3000 });
+    } catch {}
+    const popup = await popupPromise;
+
     if (popup) {
-      await popup.waitForLoadState('domcontentloaded').catch(() => {});
-      await followAutoForward(popup);
+      await popup.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+      await save(popup, 'popup_top');
       return popup;
+    } else {
+      // 同一タブ遷移だった場合
+      await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+      await save(page, 'popup_top'); // ファイル名は統一
+      return page;
     }
   }
-
-  // 同タブ遷移だった場合
-  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-  await followAutoForward(page);
-  return page;
+  throw new Error('こだわり条件のリンクが見つかりませんでした');
 }
 
-// =============== 3. 入力 → 検索 → 一覧保存 ===============
-async function fillAndSearch(condPage) {
-  logStep('fill keyword & search');
+async function fillAndSearch(p) {
+  console.log('[step] fill conditions (best-effort)');
 
-  // 住宅名（カナ）入力欄の候補
-  const inputCandidates = [
-    // アクセシビリティラベル
-    condPage.getByLabel(/住宅名（?カナ）?/),
-    // ありそうな name/placeholder/title
-    condPage.locator('input[name*="kana"]').first(),
-    condPage.locator('input[placeholder*="カナ"]').first(),
-    condPage.locator('input[title*="カナ"]').first(),
-  ];
-
-  let filled = false;
-  for (const c of inputCandidates) {
-    try {
-      if (await c.count()) {
-        await c.fill('コーシャハイム', { timeout: 4000 });
-        filled = true;
-        break;
-      }
-    } catch { /* next */ }
-  }
-  if (!filled) {
-    // ラストリゾート: DOM 走査で「カナ」っぽい input を拾う
-    await condPage.evaluate(() => {
-      const el = [...document.querySelectorAll('input')]
-        .find(i => /カナ|kana/i.test(
-          (i.getAttribute('name') || '') +
-          (i.getAttribute('placeholder') || '') +
-          (i.getAttribute('title') || '')
-        ));
-      if (el) {
-        el.focus();
-        el.value = 'コーシャハイム';
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    });
-  }
-
-  // 「検索」ボタンを押す
+  // 画面の差異が多いので、入力は最小限にし“検索する”を押下。
+  // よくあるパターン: input[type=submit][value*="検索する"] / button に“検索する”
   const searchCandidates = [
-    'button:has-text("検索")',
-    'button:has-text("さがす")',
     'input[type="submit"][value*="検索"]',
+    'button:has-text("検索する")',
     'input[type="image"][alt*="検索"]',
   ];
-  let clicked = false;
+
+  // 何かチェック必須があるときのための軽い入力（エリアの最初のチェックを入れる等）
+  // 「東京23区」等の語は画面により異なるので“最初のチェックボックス”をひとつだけ入れる。
+  try {
+    const firstCheckbox = p.locator('input[type="checkbox"]').nth(0);
+    if (await firstCheckbox.count()) {
+      await firstCheckbox.check({ timeout: 1000 }).catch(() => {});
+    }
+  } catch {}
+
+  // 検索ボタンを押す
   for (const sel of searchCandidates) {
-    const btn = condPage.locator(sel).first();
-    if (await btn.count()) {
-      await Promise.all([
-        condPage.waitForLoadState('domcontentloaded').catch(() => {}),
-        btn.click().catch(() => {}),
-      ]);
-      clicked = true;
-      break;
+    if (await p.locator(sel).first().count()) {
+      try {
+        await p.locator(sel).first().scrollIntoViewIfNeeded();
+        await p.locator(sel).first().click({ timeout: 3000 });
+        break;
+      } catch {}
     }
   }
-  if (!clicked) {
-    // 最後の手段: 「検索」を含むボタン風要素をクリック
-    await condPage.evaluate(() => {
-      const ok = [...document.querySelectorAll('button,input[type="submit"],input[type="image"]')]
-        .find(el => /検索|さがす/.test(el.value || el.alt || el.textContent || ''));
-      ok?.click();
-    });
-    await condPage.waitForLoadState('domcontentloaded').catch(() => {});
+
+  // 結果待ち & 保存（404/タイムアウトも拾って保存）
+  await p.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+  await save(p, 'result_list');
+
+  // 404 に落ちてないかの軽い判定
+  if (await p.getByText('ページが見つかりません').first().count()) {
+    throw new Error('検索後に404へ遷移しました');
   }
-
-  await followAutoForward(condPage);
-
-  // 一覧を保存（名前は result_list）
-  await savePage(condPage, 'result_list');
 }
 
-// =============== main ===============
+async function fallbackBySiteSearch(page) {
+  console.log('[fallback] use site search (result.html)');
+  // 公式のサイト内検索ページに直接アクセスして“先着順あき家検索”で検索
+  const url = 'https://www.to-kousya.or.jp/result.html?q=' + encodeURIComponent('先着順あき家検索');
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+  await save(page, 'result_list'); // とりあえず保存
+}
+
 async function main() {
-  await ensureArtDir();
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage']
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141 Safari/537.36',
+    viewport: { width: 1280, height: 2000 }
   });
+  const page = await ctx.newPage();
 
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 2000 },
-    ignoreHTTPSErrors: true,
-  });
+  console.log('[step] goto landing (prefer to-kousya)');
+  const ok = await gotoWithRetries(page, [
+    { url: 'https://www.to-kousya.or.jp/jkk/', tag: 'landing' },
+    { url: 'https://www.to-kousya.or.jp/', tag: 'landing_root' }
+  ]);
 
-  const page = await context.newPage();
+  if (!ok) {
+    await save(page, 'last_page_fallback');
+    await browser.close();
+    process.exit(1);
+  }
+
+  let popupOrSameTab;
+  try {
+    popupOrSameTab = await clickConditions(page);
+  } catch (e) {
+    // ここで落ちるときは、サイト内検索に退避（証跡は残す）
+    await save(page, 'last_page_fallback');
+    await fallbackBySiteSearch(page);
+    await browser.close();
+    return;
+  }
 
   try {
-    await gotoLanding(page);                 // TOP 保存: landing.html/png
-    const condPage = await clickConditions(page); // 同タブ or ポップアップ Page
-    await savePage(condPage, 'popup_top');   // 条件ページも一応保存
-    await fillAndSearch(condPage);           // 入力→検索→一覧保存
+    await fillAndSearch(popupOrSameTab);
   } catch (e) {
-    logFatal(e);
-    try { await saveLastFallback(page); } catch {}
-    process.exitCode = 1;
+    // 失敗しても成果物は保存して終了、最後のページも保存
+    await save(popupOrSameTab, 'last_page_fallback');
   } finally {
     await browser.close();
   }
 }
 
-main();
+main().catch(async (e) => {
+  console.error('[fatal]', e);
+  process.exit(1);
+});
